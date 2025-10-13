@@ -1,0 +1,24 @@
+{
+  "name": "node-red-contrib-rosepetal-python-executor",
+  "version": "1.0.0",
+  "description": "A Node-RED node for executing Python code, similar to the function node but for Python",
+  "main": "nodes/python-executor.js",
+  "keywords": [
+    "node-red",
+    "python",
+    "executor",
+    "function",
+    "rosepetal"
+  ],
+  "node-red": {
+    "nodes": {
+      "python-executor": "nodes/python-executor.js"
+    }
+  },
+  "author": "Rosepetal",
+  "license": "MIT",
+  "dependencies": {},
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

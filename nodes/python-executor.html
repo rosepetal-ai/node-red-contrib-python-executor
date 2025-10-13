@@ -1,0 +1,241 @@
+<script type="text/javascript">
+    RED.nodes.registerType('python-executor', {
+        category: 'function',
+        color: '#3776AB',
+        defaults: {
+            name: {value: ""},
+            func: {value: "# This code runs inside a function with 'msg' as parameter\n# You can access msg['payload'], msg['topic'], etc.\n\n# Transform the payload\nmsg['payload'] = msg['payload'] * 2\n\n# Return the modified message\nreturn msg"},
+            timeout: {value: 5000},
+            pythonPath: {value: "python3"},
+            hotMode: {value: false},
+            workerPoolSize: {value: 1},
+            preloadImports: {value: ""}
+        },
+        inputs: 1,
+        outputs: 1,
+        icon: "font-awesome/fa-code",
+        label: function() {
+            return this.name || "python executor";
+        },
+        labelStyle: function() {
+            return this.name ? "node_label_italic" : "";
+        },
+        oneditprepare: function() {
+            var that = this;
+
+            // Initialize the Python code editor
+            this.editor = RED.editor.createEditor({
+                id: 'node-input-func-editor',
+                mode: 'ace/mode/python',
+                value: $("#node-input-func").val()
+            });
+
+            // Handle timeout spinner
+            $("#node-input-timeout").spinner({
+                min: 100,
+                max: 60000,
+                step: 100
+            });
+
+            // Handle worker pool size spinner
+            $("#node-input-workerPoolSize").spinner({
+                min: 1,
+                max: 10
+            });
+
+            // Show/hide hot mode specific fields
+            function updateHotModeFields() {
+                if ($("#node-input-hotMode").is(':checked')) {
+                    $("#worker-pool-row").show();
+                    $("#preload-row").show();
+                    $("#preload-tip").show();
+                    $("#reload-row").show();
+                    $("#python-reload-workers").prop('disabled', false);
+                } else {
+                    $("#worker-pool-row").hide();
+                    $("#preload-row").hide();
+                    $("#preload-tip").hide();
+                    $("#reload-row").hide();
+                    $("#python-reload-workers").prop('disabled', true);
+                }
+            }
+
+            $("#node-input-hotMode").on('change', updateHotModeFields);
+            updateHotModeFields();
+
+            $("#python-reload-workers").on('click', function(evt) {
+                evt.preventDefault();
+
+                if (!$("#node-input-hotMode").is(':checked')) {
+                    RED.notify("Enable hot mode to use worker reload", "warning");
+                    return;
+                }
+
+                var payload = {
+                    pythonPath: $("#node-input-pythonPath").val() || "python3",
+                    workerPoolSize: parseInt($("#node-input-workerPoolSize").val(), 10) || 1,
+                    preloadImports: $("#node-input-preloadImports").val() || "",
+                    hotMode: $("#node-input-hotMode").is(':checked')
+                };
+
+                var button = $("#python-reload-workers");
+                button.prop('disabled', true);
+
+                $.ajax({
+                    url: 'python-executor/' + that.id + '/reload',
+                    type: 'POST',
+                    data: JSON.stringify(payload),
+                    contentType: 'application/json; charset=utf-8'
+                }).done(function(response) {
+                    if (response && response.created) {
+                        RED.notify("Python workers created and warmed", "success");
+                    } else {
+                        RED.notify("Python workers reloaded", "success");
+                    }
+                }).fail(function(xhr) {
+                    var err = (xhr.responseJSON && xhr.responseJSON.error) ? xhr.responseJSON.error : "Failed to reload workers";
+                    RED.notify(err, "error");
+                }).always(function() {
+                    button.prop('disabled', false);
+                });
+            });
+        },
+        oneditsave: function() {
+            // Save the editor content
+            $("#node-input-func").val(this.editor.getValue());
+            this.editor.destroy();
+            delete this.editor;
+        },
+        oneditcancel: function() {
+            this.editor.destroy();
+            delete this.editor;
+        },
+        oneditresize: function(size) {
+            var rows = $("#dialog-form>div:not(.node-text-editor-row)");
+            var height = size.height;
+            for (var i=0; i<rows.length; i++) {
+                height -= $(rows[i]).outerHeight(true);
+            }
+            var editorRow = $("#dialog-form>div.node-text-editor-row");
+            height -= (parseInt(editorRow.css("marginTop"))+parseInt(editorRow.css("marginBottom")));
+            $(".node-text-editor").css("height", height + "px");
+            this.editor.resize();
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="python-executor">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="Name">
+    </div>
+    <div class="form-row">
+        <label for="node-input-pythonPath"><i class="fa fa-cog"></i> Python Path</label>
+        <input type="text" id="node-input-pythonPath" placeholder="python3">
+    </div>
+    <div class="form-row">
+        <label for="node-input-timeout"><i class="fa fa-clock-o"></i> Timeout (ms)</label>
+        <input type="number" id="node-input-timeout" placeholder="5000" style="width: 100px;">
+    </div>
+    <div class="form-row">
+        <label for="node-input-hotMode"><i class="fa fa-bolt"></i> Hot Mode</label>
+        <input type="checkbox" id="node-input-hotMode" style="display:inline-block; width:auto; vertical-align:baseline;">
+        <span style="margin-left: 10px; color: #666;">Persistent Python worker (faster)</span>
+    </div>
+    <div class="form-row" id="worker-pool-row">
+        <label for="node-input-workerPoolSize"><i class="fa fa-server"></i> Workers</label>
+        <input type="number" id="node-input-workerPoolSize" placeholder="1" style="width: 60px;" min="1" max="10">
+        <span style="margin-left: 10px; color: #666;">Number of parallel workers (1-10)</span>
+    </div>
+    <div class="form-row" id="reload-row" style="display: none;">
+        <label>&nbsp;</label>
+        <button type="button" class="red-ui-button" id="python-reload-workers">
+            <i class="fa fa-refresh"></i> Reload Workers
+        </button>
+    </div>
+    <div class="form-row" id="preload-row">
+        <label for="node-input-preloadImports"><i class="fa fa-download"></i> Preload Imports</label>
+        <textarea id="node-input-preloadImports" rows="4" placeholder="import numpy as np&#10;import pandas as pd" style="width: 100%; resize: vertical;"></textarea>
+    </div>
+    <div class="form-tips" id="preload-tip" style="margin-top: -10px; margin-bottom: 10px;">
+        These statements run once when each hot worker starts, so heavy libraries are ready before the first message.
+    </div>
+    <div class="form-row" style="margin-bottom: 0px;">
+        <label for="node-input-func"><i class="fa fa-file-code-o"></i> Python Code</label>
+        <input type="hidden" id="node-input-func" autofocus="autofocus">
+    </div>
+    <div class="form-row node-text-editor-row">
+        <div style="height: 250px; min-height:150px;" class="node-text-editor" id="node-input-func-editor"></div>
+    </div>
+</script>
+
+<script type="text/html" data-help-name="python-executor">
+    <p>A function node that executes Python code instead of JavaScript.</p>
+
+    <h3>Details</h3>
+    <p>This node allows you to write Python code to process messages in your Node-RED flow.</p>
+
+    <h3>Inputs</h3>
+    <dl class="message-properties">
+        <dt>msg <span class="property-type">object</span></dt>
+        <dd>The input message object from the flow.</dd>
+    </dl>
+
+    <h3>Outputs</h3>
+    <dl class="message-properties">
+        <dt>msg <span class="property-type">object</span></dt>
+        <dd>The modified message object returned from Python code.</dd>
+    </dl>
+
+    <h3>Configuration</h3>
+    <dl class="message-properties">
+        <dt>Name <span class="property-type">string</span></dt>
+        <dd>Optional name for the node.</dd>
+
+        <dt>Python Path <span class="property-type">string</span></dt>
+        <dd>Path to Python interpreter (default: python3).</dd>
+
+        <dt>Timeout <span class="property-type">number</span></dt>
+        <dd>Maximum execution time in milliseconds (default: 5000).</dd>
+
+        <dt>Preload Imports <span class="property-type">string</span></dt>
+        <dd>Optional list of import statements executed once per worker when hot mode starts.</dd>
+
+        <dt>Hot Mode <span class="property-type">boolean</span></dt>
+        <dd>Enable persistent Python worker for 10-40x faster execution. Python process stays alive and reuses imports.</dd>
+
+        <dt>Workers <span class="property-type">number</span></dt>
+        <dd>Number of parallel Python workers (1-10). Only used when Hot Mode is enabled.</dd>
+    </dl>
+
+    <h3>Python Code</h3>
+    <p>Your Python code runs inside a function that receives <code>msg</code> as a parameter (a dictionary).</p>
+    <p>You can access message properties like <code>msg['payload']</code>, <code>msg['topic']</code>, etc.</p>
+    <p><strong>Important:</strong> Your code must <code>return msg</code> to send it to the next node.</p>
+
+    <h3>Example</h3>
+    <pre>
+# Access the payload
+value = msg['payload']
+
+# Transform the data
+result = value * 2
+
+# Update the message
+msg['payload'] = result
+
+# Return the message
+return msg
+    </pre>
+
+    <h3>Error Handling</h3>
+    <p>If your Python code raises an exception, the node will:</p>
+    <ul>
+        <li>Show an error status</li>
+        <li>Log the error to the debug panel</li>
+        <li>Not send any output message</li>
+    </ul>
+
+    <h3>Requirements</h3>
+    <p>Python 3 must be installed on your system and accessible via the configured Python path.</p>
+</script>
