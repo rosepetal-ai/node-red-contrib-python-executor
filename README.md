@@ -40,5 +40,13 @@ Bring Python into your Node-RED flows with a node that feels familiar, stays fri
 - **Flexible:** Supports both simple scripts and larger libraries.
 - **Fast:** Hot mode cuts response time dramatically for repeat work.
 - **Clear:** Status messages and notifications help you see what is working and what needs attention.
+- **Binary Friendly:** Hot workers stream large Buffers through shared memory instead of JSON, so images and other blobs stay fast.
+
+## Handling Large Binary Payloads
+- Hot workers drop large Buffers into `/dev/shm` (or your system temp dir) and hand Python the file handle so bytes never touch JSON.
+- Python can return `bytes`, `bytearray`, or `memoryview`; the worker writes them back to shared memory and Node converts them to Buffers automatically.
+- If the filesystem path is unavailable, the system falls back to base64 as a safety net (slower but still works).
+- Temporary blobs are cleaned up as soon as each request finishes—no manual housekeeping required.
+- The optimization is automatic—just enable hot mode when you expect heavy binary traffic.
 
 Enjoy mixing Python logic into your Node-RED projects without extra fuss. When you are ready for more performance, flip on Hot Mode and keep building.

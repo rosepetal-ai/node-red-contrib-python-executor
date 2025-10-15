@@ -1,6 +1,13 @@
 const { spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const EventEmitter = require('events');
+
+const SHM_DIR = fs.existsSync('/dev/shm') ? '/dev/shm' : os.tmpdir();
+const SHARED_SENTINEL_KEY = '__rosepetal_shm_path__';
+const SHARED_BASE64_KEY = '__rosepetal_base64__';
 
 /**
  * Python Worker - Persistent Python process for fast execution
@@ -22,6 +29,8 @@ class PythonWorker extends EventEmitter {
         this.requestCounter = 0;
         this.stopPromise = null;
         this.intentionalStop = false;
+        this.activeAttachments = [];
+        this.sharedIdSeed = crypto.randomBytes(4).toString('hex');
     }
 
     /**
@@ -63,6 +72,7 @@ class PythonWorker extends EventEmitter {
                         this._failPendingCallbacks(new Error('Worker exited unexpectedly'));
                     }
 
+                    this._cleanupActiveAttachments();
                     this.emit('exit', code);
                     this.emit('available');
                 });
@@ -70,6 +80,7 @@ class PythonWorker extends EventEmitter {
                 // Handle spawn errors
                 this.process.on('error', (err) => {
                     reject(err);
+                    this._cleanupActiveAttachments();
                     this.emit('error', err);
                 });
 
@@ -185,21 +196,22 @@ class PythonWorker extends EventEmitter {
         const callback = this.pendingCallbacks.get(requestId);
 
         if (callback) {
-            this.pendingCallbacks.delete(requestId);
-            this.busy = false;
-            this.activeRequestId = null;
-
             if (response.status === 'success') {
-                callback(null, response.result);
+                const resultPayload = this._rehydrateSharedResult(response.result);
+                callback(null, resultPayload);
             } else {
                 const error = new Error(response.error || 'Unknown error');
                 error.type = response.type;
                 error.traceback = response.traceback;
                 callback(error, null);
             }
-
-            this.emit('available');
         }
+
+        this.pendingCallbacks.delete(requestId);
+        this.busy = false;
+        this.activeRequestId = null;
+        this.emit('available');
+        this._cleanupActiveAttachments();
     }
 
     /**
@@ -223,22 +235,48 @@ class PythonWorker extends EventEmitter {
         // Store callback
         this.pendingCallbacks.set(requestId, callback);
 
-        // Prepare request
+        let preparedPayload;
+        try {
+            preparedPayload = this._prepareSharedPayload(msg);
+        } catch (err) {
+            this.busy = false;
+            this.activeRequestId = null;
+            this.pendingCallbacks.delete(requestId);
+            setImmediate(() => callback(err));
+            return null;
+        }
+
+        this.activeAttachments = preparedPayload.attachments;
+
         const request = {
             request_id: requestId,
-            msg: msg,
+            msg: preparedPayload.msg,
             code: code,
             node_id: options.nodeId,
             preload: options.preload || false
         };
 
+        let requestJson;
+        try {
+            requestJson = JSON.stringify(request);
+        } catch (err) {
+            this._cleanupAttachments(preparedPayload.attachments);
+            this.activeAttachments = [];
+            this.busy = false;
+            this.activeRequestId = null;
+            this.pendingCallbacks.delete(requestId);
+            setImmediate(() => callback(err));
+            return null;
+        }
+
         // Send request (protocol: length\n + json data)
-        const requestJson = JSON.stringify(request);
         const message = `${requestJson.length}\n${requestJson}`;
 
         try {
             this.process.stdin.write(message);
         } catch (error) {
+            this._cleanupAttachments(preparedPayload.attachments);
+            this.activeAttachments = [];
             this.busy = false;
             this.activeRequestId = null;
             this.pendingCallbacks.delete(requestId);
@@ -303,6 +341,7 @@ class PythonWorker extends EventEmitter {
         this.pendingCallbacks.clear();
         this.busy = false;
         this.activeRequestId = null;
+        this._cleanupActiveAttachments();
     }
 
     /**
@@ -313,6 +352,7 @@ class PythonWorker extends EventEmitter {
             this.ready = false;
             this.busy = false;
             this.activeRequestId = null;
+            this._cleanupActiveAttachments();
             return Promise.resolve();
         }
 
@@ -331,6 +371,7 @@ class PythonWorker extends EventEmitter {
                 currentProcess.removeListener('close', handleClose);
                 this.process = null;
                 this.stopPromise = null;
+                this._cleanupActiveAttachments();
                 resolve();
             };
 
@@ -370,6 +411,160 @@ class PythonWorker extends EventEmitter {
         this.activeRequestId = null;
 
         await this.restart();
+    }
+
+    /**
+     * Clone message, writing Buffers to shared memory files and replacing them with descriptors
+     */
+    _prepareSharedPayload(msg) {
+        const attachments = [];
+        const seen = new WeakMap();
+
+        const cloneValue = (value) => {
+            if (Buffer.isBuffer(value)) {
+                try {
+                    const filePath = this._writeBufferToSharedFile(value);
+                    attachments.push(filePath);
+                    return {
+                        [SHARED_SENTINEL_KEY]: filePath,
+                        length: value.length
+                    };
+                } catch (err) {
+                    return {
+                        [SHARED_BASE64_KEY]: value.toString('base64'),
+                        length: value.length
+                    };
+                }
+            }
+
+            if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+                const buffer = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+                return cloneValue(buffer);
+            }
+
+            if (value && typeof value === 'object') {
+                if (seen.has(value)) {
+                    return seen.get(value);
+                }
+
+                const clone = Array.isArray(value) ? [] : {};
+                seen.set(value, clone);
+
+                if (Array.isArray(value)) {
+                    value.forEach((item, idx) => {
+                        clone[idx] = cloneValue(item);
+                    });
+                } else {
+                    Object.keys(value).forEach((key) => {
+                        clone[key] = cloneValue(value[key]);
+                    });
+                }
+
+                return clone;
+            }
+
+            return value;
+        };
+
+        const clonedMsg = cloneValue(msg);
+
+        return {
+            msg: clonedMsg,
+            attachments
+        };
+    }
+
+    /**
+     * Convert shared-memory descriptors back into Buffers (and process base64 fallbacks)
+     */
+    _rehydrateSharedResult(value) {
+        const revive = (input) => {
+            if (Array.isArray(input)) {
+                return input.map((item) => revive(item));
+            }
+
+            if (input && typeof input === 'object') {
+                if (Object.prototype.hasOwnProperty.call(input, SHARED_SENTINEL_KEY)) {
+                    const filePath = input[SHARED_SENTINEL_KEY];
+                    if (!filePath || typeof filePath !== 'string') {
+                        return Buffer.alloc(0);
+                    }
+
+                    try {
+                        const data = fs.readFileSync(filePath);
+                        try {
+                            fs.unlinkSync(filePath);
+                        } catch (err) {
+                            if (err && err.code !== 'ENOENT') {
+                                console.error(`Failed to unlink shared memory file ${filePath}:`, err);
+                            }
+                        }
+                        return data;
+                    } catch (err) {
+                        console.error(`Failed to read shared memory file ${filePath}:`, err);
+                        return Buffer.alloc(0);
+                    }
+                }
+
+                if (Object.prototype.hasOwnProperty.call(input, SHARED_BASE64_KEY)) {
+                    try {
+                        return Buffer.from(input[SHARED_BASE64_KEY], 'base64');
+                    } catch (err) {
+                        console.error('Failed to decode base64 buffer from Python result:', err);
+                        return Buffer.alloc(0);
+                    }
+                }
+
+                const obj = Array.isArray(input) ? [] : {};
+                Object.keys(input).forEach((key) => {
+                    obj[key] = revive(input[key]);
+                });
+                return obj;
+            }
+
+            return input;
+        };
+
+        return revive(value);
+    }
+
+    /**
+     * Write a Buffer to a unique shared memory file
+     */
+    _writeBufferToSharedFile(buffer) {
+        const fileName = `rosepetal-python-${process.pid}-${this.workerId}-${Date.now()}-${this.sharedIdSeed}-${crypto.randomBytes(6).toString('hex')}`;
+        const filePath = path.join(SHM_DIR, fileName);
+        fs.writeFileSync(filePath, buffer);
+        return filePath;
+    }
+
+    /**
+     * Remove temporary attachments created for the active request
+     */
+    _cleanupAttachments(paths = []) {
+        if (!paths || paths.length === 0) {
+            return;
+        }
+
+        paths.forEach((filePath) => {
+            if (!filePath || typeof filePath !== 'string') {
+                return;
+            }
+            try {
+                fs.unlinkSync(filePath);
+            } catch (err) {
+                if (err && err.code !== 'ENOENT') {
+                    console.error(`Failed to unlink temporary shared memory file ${filePath}:`, err);
+                }
+            }
+        });
+    }
+
+    _cleanupActiveAttachments() {
+        if (this.activeAttachments && this.activeAttachments.length) {
+            this._cleanupAttachments(this.activeAttachments);
+        }
+        this.activeAttachments = [];
     }
 }
 

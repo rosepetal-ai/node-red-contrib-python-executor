@@ -4,16 +4,23 @@ Persistent Python Worker for Node-RED Python Executor
 Stays alive and processes multiple messages without restart overhead
 """
 
+import base64
 import json
+import os
 import sys
 import traceback
-from typing import Dict, Tuple
+import uuid
+from typing import Any, Dict, Tuple
 
 # Cache compiled user functions so imports and state persist per code string
 _CODE_CACHE: Dict[str, Tuple[object, Dict[str, object]]] = {}
 
 # Global namespaces per node/pool to share preload imports
 _NODE_GLOBALS: Dict[str, Dict[str, object]] = {}
+
+SHARED_SENTINEL_KEY = "__rosepetal_shm_path__"
+SHARED_BASE64_KEY = "__rosepetal_base64__"
+SHM_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else os.path.abspath(os.getenv("TMPDIR", "/tmp"))
 
 
 def _send_message(payload: Dict[str, object]) -> None:
@@ -58,6 +65,96 @@ def _get_or_compile(node_key: str, cache_key: str, user_code: str):
     return user_function, global_namespace
 
 
+def _read_shared_file(file_path: str) -> bytes:
+    """Read binary contents from a shared-memory file and unlink it."""
+    if not file_path or not isinstance(file_path, str):
+        return b""
+
+    try:
+        with open(file_path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return b""
+
+    try:
+        os.unlink(file_path)
+    except OSError:
+        pass
+
+    return data
+
+
+def _restore_shared_placeholders(value: Any) -> Any:
+    """Replace shared-memory placeholders with actual bytes (or decode base64)."""
+    if isinstance(value, dict):
+        if SHARED_SENTINEL_KEY in value:
+            file_path = value.get(SHARED_SENTINEL_KEY)
+            return _read_shared_file(file_path)
+
+        if SHARED_BASE64_KEY in value:
+            encoded = value.get(SHARED_BASE64_KEY) or ""
+            try:
+                return base64.b64decode(encoded)
+            except Exception:
+                return b""
+
+        return {key: _restore_shared_placeholders(child) for key, child in value.items()}
+
+    if isinstance(value, list):
+        return [_restore_shared_placeholders(item) for item in value]
+
+    if isinstance(value, tuple):
+        return tuple(_restore_shared_placeholders(item) for item in value)
+
+    return value
+
+
+def _ensure_shared_dir() -> None:
+    """Ensure the shared memory directory exists."""
+    try:
+        os.makedirs(SHM_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+
+def _write_shared_file(data: bytes) -> str:
+    """Persist bytes to a shared memory file and return its path."""
+    _ensure_shared_dir()
+    file_path = os.path.join(SHM_DIR, f"rosepetal-python-{os.getpid()}-{uuid.uuid4().hex}")
+    with open(file_path, "wb") as fh:
+        fh.write(data)
+    return file_path
+
+
+def _encode_shared_outputs(value: Any) -> Any:
+    """Traverse the result object converting bytes into shared-memory descriptors."""
+    if isinstance(value, dict):
+        return {key: _encode_shared_outputs(child) for key, child in value.items()}
+
+    if isinstance(value, list):
+        return [_encode_shared_outputs(item) for item in value]
+
+    if isinstance(value, tuple):
+        return [_encode_shared_outputs(item) for item in value]
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        data = bytes(value)
+        try:
+            file_path = _write_shared_file(data)
+            return {
+                SHARED_SENTINEL_KEY: file_path,
+                "length": len(data)
+            }
+        except OSError:
+            encoded = base64.b64encode(data).decode("ascii") if data else ""
+            return {
+                SHARED_BASE64_KEY: encoded,
+                "length": len(data)
+            }
+
+    return value
+
+
 def main():
     """Main worker loop - stays alive and processes messages continuously"""
 
@@ -92,21 +189,25 @@ def main():
 
             # Execute user code
             try:
+                msg = _restore_shared_placeholders(msg)
                 if is_preload:
                     namespace = _get_namespace(node_id)
                     exec(user_code, namespace, namespace)
-                    result = {}
+                    result_object: Any = {}
                 else:
                     user_function, _ = _get_or_compile(node_id, cache_key, user_code)
 
                     # Call the user function
-                    result = user_function(msg)
+                    result_value = user_function(msg)
+                    result_object = result_value if result_value is not None else {}
+
+                result_object = _encode_shared_outputs(result_object)
 
                 # Send response
                 response = {
                     "status": "success",
                     "request_id": request_id,
-                    "result": result if result is not None else {},
+                    "result": result_object,
                 }
 
             except Exception as exc:
