@@ -8,9 +8,10 @@ import base64
 import json
 import os
 import sys
+import time
 import traceback
 import uuid
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 # Cache compiled user functions so imports and state persist per code string
 _CODE_CACHE: Dict[str, Tuple[object, Dict[str, object]]] = {}
@@ -23,9 +24,22 @@ SHARED_BASE64_KEY = "__rosepetal_base64__"
 SHM_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else os.path.abspath(os.getenv("TMPDIR", "/tmp"))
 
 
-def _send_message(payload: Dict[str, object]) -> None:
-    """Send a JSON payload to stdout using length-prefixed framing."""
+def _send_message(payload: Dict[str, object], *, encode_start: Optional[float] = None) -> None:
+    """Send a JSON payload to stdout using length-prefixed framing.
+
+    When encode_start is provided alongside a payload.performance dict, the
+    helper computes the elapsed time (ms) since encode_start and stores it in
+    payload["performance"]["transfer_to_js_ms"] before emitting the frame.
+    """
     message_json = json.dumps(payload, separators=(",", ":"))
+
+    if (
+        encode_start is not None
+        and isinstance(payload.get("performance"), dict)
+    ):
+        payload["performance"]["transfer_to_js_ms"] = (time.perf_counter() - encode_start) * 1000.0
+        message_json = json.dumps(payload, separators=(",", ":"))
+
     sys.stdout.write(f"{len(message_json)}\n{message_json}\n")
     sys.stdout.flush()
 
@@ -163,6 +177,8 @@ def main():
 
     while True:
         try:
+            transfer_in_start: Optional[float] = None
+
             # Read message length first (protocol: length\n + json data)
             line = sys.stdin.readline()
             if not line:
@@ -170,6 +186,7 @@ def main():
                 break
 
             length = int(line.strip())
+            transfer_in_start = time.perf_counter()
 
             # Read the JSON message
             json_data = sys.stdin.read(length)
@@ -190,17 +207,31 @@ def main():
             # Execute user code
             try:
                 msg = _restore_shared_placeholders(msg)
+                after_restore = time.perf_counter()
+                transfer_to_python_ms = 0.0
+                if transfer_in_start is not None:
+                    transfer_to_python_ms = (after_restore - transfer_in_start) * 1000.0
+
+                execution_ms = 0.0
+
                 if is_preload:
                     namespace = _get_namespace(node_id)
+                    exec_start = time.perf_counter()
                     exec(user_code, namespace, namespace)
+                    exec_end = time.perf_counter()
+                    execution_ms = (exec_end - exec_start) * 1000.0
                     result_object: Any = {}
                 else:
                     user_function, _ = _get_or_compile(node_id, cache_key, user_code)
 
                     # Call the user function
+                    exec_start = time.perf_counter()
                     result_value = user_function(msg)
+                    exec_end = time.perf_counter()
+                    execution_ms = (exec_end - exec_start) * 1000.0
                     result_object = result_value if result_value is not None else {}
 
+                transfer_out_start = time.perf_counter()
                 result_object = _encode_shared_outputs(result_object)
 
                 # Send response
@@ -208,9 +239,27 @@ def main():
                     "status": "success",
                     "request_id": request_id,
                     "result": result_object,
+                    "performance": {
+                        "transfer_to_python_ms": transfer_to_python_ms,
+                        "execution_ms": execution_ms,
+                        "transfer_to_js_ms": 0.0,
+                    },
                 }
 
+            # Send response (protocol: length\n + json data)
+                _send_message(response, encode_start=transfer_out_start)
+
             except Exception as exc:
+                error_performance = {
+                    "transfer_to_python_ms": (
+                        (time.perf_counter() - transfer_in_start) * 1000.0
+                        if transfer_in_start is not None
+                        else 0.0
+                    ),
+                    "execution_ms": locals().get("execution_ms", 0.0),
+                    "transfer_to_js_ms": 0.0,
+                }
+                transfer_out_start = time.perf_counter()
                 # Send error response
                 response = {
                     "status": "error",
@@ -218,10 +267,9 @@ def main():
                     "error": str(exc),
                     "type": type(exc).__name__,
                     "traceback": traceback.format_exc(),
+                    "performance": error_performance,
                 }
-
-            # Send response (protocol: length\n + json data)
-            _send_message(response)
+                _send_message(response, encode_start=transfer_out_start)
 
         except KeyboardInterrupt:
             # Graceful shutdown

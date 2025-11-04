@@ -78,7 +78,7 @@ function flushHotQueue(node, error) {
                 node.error(errObj, entry.msg);
             }
         } else {
-            executeHotMode(node, entry.msg, entry.send, entry.done);
+            executeHotMode(node, entry.msg, entry.send, entry.done, entry.timing);
         }
     });
 }
@@ -164,16 +164,63 @@ function attachPoolReadyWatcher(node) {
     node.status({ fill: "grey", shape: "ring", text: "hot: starting" });
 }
 
-function queueHotMessage(node, msg, send, done) {
+function queueHotMessage(node, msg, send, done, timing) {
     if (!node.hotPending) {
         node.hotPending = [];
     }
 
-    node.hotPending.push({ msg, send, done });
+    node.hotPending.push({ msg, send, done, timing });
     attachPoolReadyWatcher(node);
     if (node.hotMode) {
         node.status({ fill: "grey", shape: "ring", text: "hot: queueing" });
     }
+}
+
+function normalizePerformanceValue(value) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function hrtimeDiffToMs(start) {
+    if (typeof start !== 'bigint') {
+        return 0;
+    }
+    const diff = process.hrtime.bigint() - start;
+    return Number(diff) / 1e6;
+}
+
+function applyPerformanceMetrics(node, originalMsg, targetMsg, performance) {
+    if (!performance || typeof performance !== 'object') {
+        return;
+    }
+
+    const label = (typeof node.name === 'string' && node.name.trim()) ? node.name.trim() : 'python executor';
+    if (!label) {
+        return;
+    }
+
+    const copyPerformance = (source, destination) => {
+        if (source && typeof source === 'object' && !Array.isArray(source)) {
+            Object.keys(source).forEach((key) => {
+                destination[key] = source[key];
+            });
+        }
+    };
+
+    const collected = {};
+    if (originalMsg && originalMsg !== targetMsg) {
+        copyPerformance(originalMsg.performance, collected);
+    }
+    copyPerformance(targetMsg.performance, collected);
+
+    collected[label] = {
+        transferToPythonMs: normalizePerformanceValue(performance.transfer_to_python_ms ?? performance.transferToPythonMs),
+        executionMs: normalizePerformanceValue(performance.execution_ms ?? performance.executionMs),
+        transferToJsMs: normalizePerformanceValue(performance.transfer_to_js_ms ?? performance.transferToJsMs),
+        totalMs: normalizePerformanceValue(performance.totalMs ?? performance.total_ms ?? performance.total)
+    };
+
+    targetMsg.performance = collected;
 }
 
 module.exports = function(RED) {
@@ -251,6 +298,8 @@ module.exports = function(RED) {
                 }
             };
 
+            const timing = { start: process.hrtime.bigint() };
+
             if (node.hotMode) {
                 const existingPool = node.workerPoolKey ? workerPools.get(node.workerPoolKey) : null;
                 if (existingPool && node.workerPool !== existingPool) {
@@ -287,13 +336,13 @@ module.exports = function(RED) {
                 const poolReady = typeof node.workerPool.isReady === 'function' ? node.workerPool.isReady() : false;
 
                 if (!poolReady) {
-                    queueHotMessage(node, msg, send, done);
+                    queueHotMessage(node, msg, send, done, timing);
                     return;
                 }
 
-                executeHotMode(node, msg, send, done);
+                executeHotMode(node, msg, send, done, timing);
             } else {
-                executeColdMode(node, msg, send, done);
+                executeColdMode(node, msg, send, done, timing);
             }
         });
 
@@ -310,7 +359,7 @@ module.exports = function(RED) {
     /**
      * Execute Python code in HOT mode (persistent worker)
      */
-    function executeHotMode(node, msg, send, done) {
+    function executeHotMode(node, msg, send, done, timing) {
         const startTime = Date.now();
         let timedOut = false;
         let cancelHandle = null;
@@ -333,7 +382,7 @@ module.exports = function(RED) {
         }, node.timeout);
 
         // Execute on worker pool
-        const executionCallback = (error, result) => {
+        const executionCallback = (error, payload) => {
             if (timedOut) {
                 return;
             }
@@ -350,8 +399,28 @@ module.exports = function(RED) {
                 return;
             }
 
+            let resultData;
+            let performanceData = null;
+
+            if (payload && typeof payload === 'object' && Object.prototype.hasOwnProperty.call(payload, 'result')) {
+                resultData = payload.result;
+                performanceData = payload.performance || null;
+            } else {
+                resultData = payload;
+            }
+
+            if (resultData === undefined || resultData === null) {
+                resultData = {};
+            }
+
+            const totalMs = hrtimeDiffToMs(timing && timing.start);
+
             // Merge result into original message
-            const outputMsg = Object.assign({}, msg, result);
+            const outputMsg = Object.assign({}, msg, resultData || {});
+
+            const mergedPerformance = Object.assign({}, performanceData || {});
+            mergedPerformance.totalMs = totalMs;
+            applyPerformanceMetrics(node, msg, outputMsg, mergedPerformance);
 
             // Send output
             send(outputMsg);
@@ -386,7 +455,7 @@ module.exports = function(RED) {
     /**
      * Execute Python code in COLD mode (spawn new process)
      */
-    function executeColdMode(node, msg, send, done) {
+    function executeColdMode(node, msg, send, done, timing) {
         // Show running status
         node.status({ fill: "blue", shape: "dot", text: "cold: running" });
 
@@ -396,24 +465,47 @@ module.exports = function(RED) {
         const pythonScript = `
 import sys
 import json
+import time
+
+transfer_start = time.perf_counter()
+input_data = sys.stdin.read()
 
 try:
-    # Read input message from stdin
-    input_data = sys.stdin.read()
     msg = json.loads(input_data)
+except Exception as e:
+    error_msg = {
+        "error": str(e),
+        "type": type(e).__name__
+    }
+    print(json.dumps(error_msg), file=sys.stderr)
+    sys.exit(1)
 
-    # Define user function to allow return statements
-    def user_function(msg):
-${node.func.split('\n').map(line => '        ' + line).join('\n')}
+transfer_to_python_ms = (time.perf_counter() - transfer_start) * 1000.0
+execution_ms = 0.0
 
-    # Execute user function
+def user_function(msg):
+${node.func.split('\n').map(line => '    ' + line).join('\n')}
+
+try:
+    exec_start = time.perf_counter()
     result = user_function(msg)
+    exec_end = time.perf_counter()
+    execution_ms = (exec_end - exec_start) * 1000.0
 
-    # Output the result
-    if result is not None:
-        print(json.dumps(result))
-    else:
-        print(json.dumps({}))
+    result_obj = result if result is not None else {}
+    transfer_back_start = time.perf_counter()
+    payload = {
+        "__rosepetal_result": result_obj,
+        "__rosepetal_performance": {
+            "transfer_to_python_ms": transfer_to_python_ms,
+            "execution_ms": execution_ms,
+            "transfer_to_js_ms": 0.0
+        }
+    }
+    _ = json.dumps(payload)
+    after_dump = time.perf_counter()
+    payload["__rosepetal_performance"]["transfer_to_js_ms"] = (after_dump - transfer_back_start) * 1000.0
+    print(json.dumps(payload))
 
 except Exception as e:
     error_msg = {
@@ -475,11 +567,25 @@ except Exception as e:
 
                 // Parse output
                 try {
-                    const result = JSON.parse(stdoutData.trim());
+                    const rawOutput = JSON.parse(stdoutData.trim());
                     const execTime = Date.now() - startTime;
+                    const totalMs = hrtimeDiffToMs(timing && timing.start);
+
+                    let resultPayload;
+                    let performanceData = null;
+
+                    if (rawOutput && typeof rawOutput === 'object' && Object.prototype.hasOwnProperty.call(rawOutput, '__rosepetal_result')) {
+                        resultPayload = rawOutput.__rosepetal_result || {};
+                        performanceData = rawOutput.__rosepetal_performance || null;
+                    } else {
+                        resultPayload = rawOutput || {};
+                    }
 
                     // Merge result into original message
-                    const outputMsg = Object.assign({}, msg, result);
+                    const outputMsg = Object.assign({}, msg, resultPayload || {});
+                    const mergedPerformance = Object.assign({}, performanceData || {});
+                    mergedPerformance.totalMs = totalMs;
+                    applyPerformanceMetrics(node, msg, outputMsg, mergedPerformance);
 
                     // Send output
                     send(outputMsg);

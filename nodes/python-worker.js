@@ -198,11 +198,15 @@ class PythonWorker extends EventEmitter {
         if (callback) {
             if (response.status === 'success') {
                 const resultPayload = this._rehydrateSharedResult(response.result);
-                callback(null, resultPayload);
+                const performance = response.performance || null;
+                callback(null, { result: resultPayload, performance });
             } else {
                 const error = new Error(response.error || 'Unknown error');
                 error.type = response.type;
                 error.traceback = response.traceback;
+                if (response.performance) {
+                    error.performance = response.performance;
+                }
                 callback(error, null);
             }
         }
