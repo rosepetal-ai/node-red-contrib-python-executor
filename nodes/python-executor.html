@@ -30,6 +30,13 @@
                 value: $("#node-input-func").val()
             });
 
+            // Initialize preload imports editor (Python mode as well)
+            this.preloadEditor = RED.editor.createEditor({
+                id: 'node-input-preloadImports-editor',
+                mode: 'ace/mode/python',
+                value: $("#node-input-preloadImports").val()
+            });
+
             // Handle timeout spinner
             $("#node-input-timeout").spinner({
                 min: 100,
@@ -48,12 +55,14 @@
                 if ($("#node-input-hotMode").is(':checked')) {
                     $("#worker-pool-row").show();
                     $("#preload-row").show();
+                    $("#preload-editor-row").show();
                     $("#preload-tip").show();
                     $("#reload-row").show();
                     $("#python-reload-workers").prop('disabled', false);
                 } else {
                     $("#worker-pool-row").hide();
                     $("#preload-row").hide();
+                    $("#preload-editor-row").hide();
                     $("#preload-tip").hide();
                     $("#reload-row").hide();
                     $("#python-reload-workers").prop('disabled', true);
@@ -103,12 +112,17 @@
         oneditsave: function() {
             // Save the editor content
             $("#node-input-func").val(this.editor.getValue());
+            $("#node-input-preloadImports").val(this.preloadEditor.getValue());
             this.editor.destroy();
+            this.preloadEditor.destroy();
             delete this.editor;
+            delete this.preloadEditor;
         },
         oneditcancel: function() {
             this.editor.destroy();
+            this.preloadEditor.destroy();
             delete this.editor;
+            delete this.preloadEditor;
         },
         oneditresize: function(size) {
             var rows = $("#dialog-form>div:not(.node-text-editor-row)");
@@ -116,9 +130,24 @@
             for (var i=0; i<rows.length; i++) {
                 height -= $(rows[i]).outerHeight(true);
             }
-            var editorRow = $("#dialog-form>div.node-text-editor-row");
-            height -= (parseInt(editorRow.css("marginTop"))+parseInt(editorRow.css("marginBottom")));
-            $(".node-text-editor").css("height", height + "px");
+
+            // Split available space between preload and main editors
+            var editorRows = $("#dialog-form>div.node-text-editor-row");
+            var totalMargins = 0;
+            editorRows.each(function() {
+                totalMargins += parseInt($(this).css("marginTop")) + parseInt($(this).css("marginBottom"));
+            });
+            height -= totalMargins;
+
+            var preloadHeight = Math.max(150, Math.floor(height * 0.35));
+            var funcHeight = Math.max(200, height - preloadHeight);
+
+            $("#node-input-preloadImports-editor").css("height", preloadHeight + "px");
+            $("#node-input-func-editor").css("height", funcHeight + "px");
+
+            if (this.preloadEditor) {
+                this.preloadEditor.resize();
+            }
             this.editor.resize();
         }
     });
@@ -155,7 +184,10 @@
     </div>
     <div class="form-row" id="preload-row">
         <label for="node-input-preloadImports"><i class="fa fa-download"></i> Preload Imports</label>
-        <textarea id="node-input-preloadImports" rows="4" placeholder="import numpy as np&#10;import pandas as pd" style="width: 100%; resize: vertical;"></textarea>
+        <input type="hidden" id="node-input-preloadImports">
+    </div>
+    <div class="form-row node-text-editor-row" id="preload-editor-row">
+        <div style="height: 180px; min-height: 150px;" class="node-text-editor" id="node-input-preloadImports-editor"></div>
     </div>
     <div class="form-tips" id="preload-tip" style="margin-top: -10px; margin-bottom: 10px;">
         These statements run once when each hot worker starts, so heavy libraries are ready before the first message.
