@@ -3,7 +3,54 @@ const { spawn } = require('child_process');
 const { PythonWorkerPool } = require('./python-worker');
 
 // Global worker pools (one per unique configuration)
+// Map key -> { pool: PythonWorkerPool, refCount: number }
 const workerPools = new Map();
+
+function getWorkerPoolEntry(key) {
+    return workerPools.get(key) || null;
+}
+
+function getWorkerPool(key) {
+    const entry = getWorkerPoolEntry(key);
+    return entry ? entry.pool : null;
+}
+
+function acquireWorkerPool(key, pythonPath, poolSize, preloadImports) {
+    let created = false;
+    let entry = workerPools.get(key);
+
+    if (!entry) {
+        entry = {
+            pool: new PythonWorkerPool(pythonPath, poolSize, preloadImports, key),
+            refCount: 0
+        };
+        workerPools.set(key, entry);
+        created = true;
+    }
+
+    entry.refCount += 1;
+
+    return { pool: entry.pool, created };
+}
+
+function releaseWorkerPool(key) {
+    const entry = workerPools.get(key);
+
+    if (!entry) {
+        return Promise.resolve();
+    }
+
+    entry.refCount = Math.max(0, entry.refCount - 1);
+
+    if (entry.refCount === 0) {
+        workerPools.delete(key);
+        return entry.pool.stop().catch((err) => {
+            console.error(`Failed to stop worker pool for ${key}:`, err);
+        });
+    }
+
+    return Promise.resolve();
+}
 
 function getHotStats(pool) {
     if (!pool || typeof pool.getStats !== 'function') {
@@ -246,6 +293,7 @@ module.exports = function(RED) {
         node.poolReadyHandler = null;
         node.poolErrorHandler = null;
         node.poolReloadHandler = null;
+        node.poolRefAcquired = false;
 
         // Initialize worker pool if hot mode is enabled
         let poolCreated = false;
@@ -253,12 +301,13 @@ module.exports = function(RED) {
         if (node.hotMode) {
             node.workerPoolKey = createPoolKey(node.pythonPath, node.workerPoolSize, node.preloadImports);
 
-            if (!workerPools.has(node.workerPoolKey)) {
-                // Create new worker pool
-                const pool = new PythonWorkerPool(node.pythonPath, node.workerPoolSize, node.preloadImports, node.workerPoolKey);
-                poolCreated = true;
+            const poolResult = acquireWorkerPool(node.workerPoolKey, node.pythonPath, node.workerPoolSize, node.preloadImports);
+            node.workerPool = poolResult.pool;
+            node.poolRefAcquired = true;
+            poolCreated = poolResult.created;
 
-                pool.initialize()
+            if (poolCreated) {
+                node.workerPool.initialize()
                     .then(() => {
                         if (node.preloadImports && node.preloadImports.trim()) {
                             node.log(`Hot mode preloaded imports executed for ${node.workerPoolSize} worker(s)`);
@@ -269,19 +318,14 @@ module.exports = function(RED) {
                         node.error(`Failed to initialize worker pool: ${error.message}`);
                         node.status({ fill: "yellow", shape: "ring", text: "hot: disabled" });
                         detachPoolReadyWatcher(node);
-                        workerPools.delete(node.workerPoolKey);
                         node.workerPool = null;
                         node.useHot = false;
                         node.hotError = error instanceof Error ? error : new Error(String(error));
                         flushHotQueue(node, node.hotError);
+                        node.poolRefAcquired = false;
+                        releaseWorkerPool(node.workerPoolKey);
                     });
-
-                workerPools.set(node.workerPoolKey, pool);
-            }
-
-            node.workerPool = workerPools.get(node.workerPoolKey);
-
-            if (!poolCreated && node.workerPool) {
+            } else if (node.workerPool) {
                 node.log(`Hot mode using existing worker pool (python: ${node.pythonPath}, workers: ${node.workerPoolSize})`);
             }
 
@@ -301,7 +345,7 @@ module.exports = function(RED) {
             const timing = { start: process.hrtime.bigint() };
 
             if (node.hotMode) {
-                const existingPool = node.workerPoolKey ? workerPools.get(node.workerPoolKey) : null;
+                const existingPool = node.workerPoolKey ? getWorkerPool(node.workerPoolKey) : null;
                 if (existingPool && node.workerPool !== existingPool) {
                     detachPoolReadyWatcher(node);
                     node.workerPool = existingPool;
@@ -347,12 +391,27 @@ module.exports = function(RED) {
         });
 
         // Clean up on node close
-        node.on('close', function() {
+        node.on('close', function(removed, done) {
             detachPoolReadyWatcher(node);
             node.hotPending = [];
             node.useHot = false;
             node.status({});
-            // Note: Worker pools are shared and cleaned up globally
+
+            const finish = (typeof done === 'function') ? done : (typeof removed === 'function' ? removed : () => {});
+
+            const releasePromise = (node.poolRefAcquired && node.workerPoolKey)
+                ? releaseWorkerPool(node.workerPoolKey)
+                : Promise.resolve();
+
+            node.poolRefAcquired = false;
+
+            if (releasePromise && typeof releasePromise.then === 'function') {
+                releasePromise
+                    .then(() => finish())
+                    .catch(() => finish());
+            } else {
+                finish();
+            }
         });
     }
 
@@ -633,8 +692,8 @@ except Exception as e:
     // Cleanup worker pools on Node-RED shutdown
     RED.events.on("runtime-event", function(event) {
         if (event.id === "runtime-shutdown") {
-            workerPools.forEach((pool, key) => {
-                pool.stop();
+            workerPools.forEach((entry, key) => {
+                entry.pool.stop();
             });
             workerPools.clear();
         }
@@ -663,11 +722,12 @@ except Exception as e:
         const preloadImports = (body.preloadImports || "").trim();
         const poolKey = createPoolKey(pythonPath, workerPoolSize, preloadImports);
 
-        let pool = workerPools.get(poolKey);
+        const existingEntry = getWorkerPoolEntry(poolKey);
+        let pool = existingEntry ? existingEntry.pool : null;
 
         if (!pool) {
             pool = new PythonWorkerPool(pythonPath, workerPoolSize, preloadImports, poolKey);
-            workerPools.set(poolKey, pool);
+            workerPools.set(poolKey, { pool, refCount: 0 });
 
             pool.initialize()
                 .then(() => {
