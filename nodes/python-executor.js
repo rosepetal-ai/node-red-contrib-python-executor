@@ -68,6 +68,69 @@ function createPoolKey(pythonPath, poolSize, preloadImports) {
     return `${pythonPath}_${poolSize}_${hash}`;
 }
 
+function extractMsgKeysFromCode(code) {
+    const keys = new Set();
+    if (typeof code !== 'string' || !code.trim()) {
+        return keys;
+    }
+
+    // msg['payload'] or msg["payload"]
+    const bracketRegex = /msg\[['"]([A-Za-z0-9_.$:-]+)['"]\]/g;
+    let match = bracketRegex.exec(code);
+    while (match) {
+        keys.add(match[1]);
+        match = bracketRegex.exec(code);
+    }
+
+    // msg.get('payload', default)
+    const getRegex = /msg\.get\(\s*['"]([^'"]+)['"]/g;
+    match = getRegex.exec(code);
+    while (match) {
+        keys.add(match[1]);
+        match = getRegex.exec(code);
+    }
+
+    // msg.payload style access (skip common dict methods)
+    const skipMethods = new Set(['get', 'items', 'keys', 'values', 'copy', 'pop', 'popitem', 'clear', 'update', 'setdefault']);
+    const dotRegex = /msg\.([A-Za-z_][A-Za-z0-9_]*)/g;
+    match = dotRegex.exec(code);
+    while (match) {
+        if (!skipMethods.has(match[1])) {
+            keys.add(match[1]);
+        }
+        match = dotRegex.exec(code);
+    }
+
+    return keys;
+}
+
+function buildPythonInputMsg(originalMsg, code) {
+    if (!originalMsg || typeof originalMsg !== 'object') {
+        return originalMsg;
+    }
+
+    const keys = extractMsgKeysFromCode(code);
+
+    // If we cannot confidently determine keys, fall back to full message
+    if (!keys || keys.size === 0) {
+        return originalMsg;
+    }
+
+    const subset = {};
+    keys.forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(originalMsg, key)) {
+            subset[key] = originalMsg[key];
+        }
+    });
+
+    // Preserve _msgid for traceability
+    if (Object.prototype.hasOwnProperty.call(originalMsg, '_msgid') && !Object.prototype.hasOwnProperty.call(subset, '_msgid')) {
+        subset._msgid = originalMsg._msgid;
+    }
+
+    return subset;
+}
+
 function buildHotStatusSuffix(pool) {
     const stats = getHotStats(pool);
     if (!stats || typeof stats.total === 'undefined') {
@@ -125,7 +188,7 @@ function flushHotQueue(node, error) {
                 node.error(errObj, entry.msg);
             }
         } else {
-            executeHotMode(node, entry.msg, entry.send, entry.done, entry.timing);
+            executeHotMode(node, entry.originalMsg, entry.pythonMsg, entry.send, entry.done, entry.timing);
         }
     });
 }
@@ -211,12 +274,12 @@ function attachPoolReadyWatcher(node) {
     node.status({ fill: "grey", shape: "ring", text: "hot: starting" });
 }
 
-function queueHotMessage(node, msg, send, done, timing) {
+function queueHotMessage(node, msg, pythonMsg, send, done, timing) {
     if (!node.hotPending) {
         node.hotPending = [];
     }
 
-    node.hotPending.push({ msg, send, done, timing });
+    node.hotPending.push({ originalMsg: msg, pythonMsg, send, done, timing });
     attachPoolReadyWatcher(node);
     if (node.hotMode) {
         node.status({ fill: "grey", shape: "ring", text: "hot: queueing" });
@@ -343,6 +406,7 @@ module.exports = function(RED) {
             };
 
             const timing = { start: process.hrtime.bigint() };
+            const pythonMsg = buildPythonInputMsg(msg, node.func);
 
             if (node.hotMode) {
                 const existingPool = node.workerPoolKey ? getWorkerPool(node.workerPoolKey) : null;
@@ -380,13 +444,13 @@ module.exports = function(RED) {
                 const poolReady = typeof node.workerPool.isReady === 'function' ? node.workerPool.isReady() : false;
 
                 if (!poolReady) {
-                    queueHotMessage(node, msg, send, done, timing);
+                    queueHotMessage(node, msg, pythonMsg, send, done, timing);
                     return;
                 }
 
-                executeHotMode(node, msg, send, done, timing);
+                executeHotMode(node, msg, pythonMsg, send, done, timing);
             } else {
-                executeColdMode(node, msg, send, done, timing);
+                executeColdMode(node, msg, pythonMsg, send, done, timing);
             }
         });
 
@@ -418,7 +482,7 @@ module.exports = function(RED) {
     /**
      * Execute Python code in HOT mode (persistent worker)
      */
-    function executeHotMode(node, msg, send, done, timing) {
+    function executeHotMode(node, originalMsg, pythonMsg, send, done, timing) {
         const startTime = Date.now();
         let timedOut = false;
         let cancelHandle = null;
@@ -475,11 +539,11 @@ module.exports = function(RED) {
             const totalMs = hrtimeDiffToMs(timing && timing.start);
 
             // Merge result into original message
-            const outputMsg = Object.assign({}, msg, resultData || {});
+            const outputMsg = Object.assign({}, originalMsg, resultData || {});
 
             const mergedPerformance = Object.assign({}, performanceData || {});
             mergedPerformance.totalMs = totalMs;
-            applyPerformanceMetrics(node, msg, outputMsg, mergedPerformance);
+            applyPerformanceMetrics(node, originalMsg, outputMsg, mergedPerformance);
 
             // Send output
             send(outputMsg);
@@ -495,7 +559,7 @@ module.exports = function(RED) {
         };
 
         try {
-            cancelHandle = node.workerPool.execute(msg, node.func, executionCallback, { nodeId: node.workerPoolKey });
+            cancelHandle = node.workerPool.execute(pythonMsg, node.func, executionCallback, { nodeId: node.workerPoolKey });
         } catch (dispatchError) {
             clearTimeout(timeoutId);
             const errObj = dispatchError instanceof Error ? dispatchError : new Error(String(dispatchError));
@@ -514,7 +578,7 @@ module.exports = function(RED) {
     /**
      * Execute Python code in COLD mode (spawn new process)
      */
-    function executeColdMode(node, msg, send, done, timing) {
+    function executeColdMode(node, msg, pythonMsg, send, done, timing) {
         // Show running status
         node.status({ fill: "blue", shape: "dot", text: "cold: running" });
 
@@ -676,7 +740,7 @@ except Exception as e:
 
             // Send input message to Python stdin
             try {
-                const inputJson = JSON.stringify(msg);
+                const inputJson = JSON.stringify(pythonMsg);
                 pythonProcess.stdin.write(inputJson);
                 pythonProcess.stdin.end();
             } catch (e) {
