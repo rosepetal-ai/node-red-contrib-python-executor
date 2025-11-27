@@ -1,6 +1,8 @@
 # node-red-contrib-rosepetal-python-executor
 
-Bring Python into your Node-RED flows with a node that feels familiar, stays friendly, and keeps things fast when you need it.
+Python into your Node-RED flows with a node that feels familiar, stays friendly, and keeps things fast when you need it.
+
+![Example](assets/example.png)
 
 ## What You Get
 - Run small Python snippets whenever a message arrives.
