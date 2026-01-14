@@ -63,9 +63,10 @@ function getHotStats(pool) {
     }
 }
 
-function createPoolKey(pythonPath, poolSize, preloadImports) {
+function createPoolKey(pythonPath, poolSize, preloadImports, environmentId) {
     const hash = crypto.createHash('md5').update(preloadImports || '').digest('hex');
-    return `${pythonPath}_${poolSize}_${hash}`;
+    const envKey = environmentId || 'direct';
+    return `${envKey}_${poolSize}_${hash}`;
 }
 
 function extractMsgKeysFromCode(code) {
@@ -342,7 +343,21 @@ module.exports = function(RED) {
         node.func = config.func || "";
         node.outputs = 1;
         node.timeout = config.timeout || 5000;
-        node.pythonPath = config.pythonPath || "python3";
+
+        // Get pythonPath from environment config node or use direct path
+        node.pythonEnvironmentId = null;
+        if (config.pythonEnvironment) {
+            const envNode = RED.nodes.getNode(config.pythonEnvironment);
+            if (envNode && envNode.pythonPath) {
+                node.pythonPath = envNode.pythonPath;
+                node.pythonEnvironmentId = config.pythonEnvironment;
+            } else {
+                node.warn("Python environment not found, using fallback");
+                node.pythonPath = config.pythonPath || "python3";
+            }
+        } else {
+            node.pythonPath = config.pythonPath || "python3";
+        }
         node.hotMode = config.hotMode !== undefined ? config.hotMode : false;
         node.workerPoolSize = config.workerPoolSize || 1;
         node.preloadImports = (config.preloadImports || "").trim();
@@ -362,7 +377,7 @@ module.exports = function(RED) {
         let poolCreated = false;
 
         if (node.hotMode) {
-            node.workerPoolKey = createPoolKey(node.pythonPath, node.workerPoolSize, node.preloadImports);
+            node.workerPoolKey = createPoolKey(node.pythonPath, node.workerPoolSize, node.preloadImports, node.pythonEnvironmentId);
 
             const poolResult = acquireWorkerPool(node.workerPoolKey, node.pythonPath, node.workerPoolSize, node.preloadImports);
             node.workerPool = poolResult.pool;

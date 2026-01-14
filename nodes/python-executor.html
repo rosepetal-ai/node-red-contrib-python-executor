@@ -6,7 +6,8 @@
             name: {value: ""},
             func: {value: "# This code runs inside a function with 'msg' as parameter\n# You can access msg['payload'], msg['topic'], etc.\n\n# Transform the payload\nmsg['payload'] = msg['payload'] * 2\n\n# Return the modified message\nreturn msg"},
             timeout: {value: 5000},
-            pythonPath: {value: "python3"},
+            pythonEnvironment: {value: "", type: "python-environment"},
+            pythonPath: {value: "python3"},  // Kept for backwards compatibility
             hotMode: {value: false},
             workerPoolSize: {value: 1},
             preloadImports: {value: ""}
@@ -49,6 +50,20 @@
                 min: 1,
                 max: 10
             });
+
+            // Show/hide pythonPath based on environment selection
+            function updatePythonPathVisibility() {
+                var envVal = $("#node-input-pythonEnvironment").val();
+                if (envVal && envVal !== "_ADD_") {
+                    $("#pythonPath-row").hide();
+                } else {
+                    $("#pythonPath-row").show();
+                }
+            }
+
+            // Watch for environment changes
+            $("#node-input-pythonEnvironment").on('change', updatePythonPathVisibility);
+            setTimeout(updatePythonPathVisibility, 100);
 
             // Show/hide hot mode specific fields
             function updateHotModeFields() {
@@ -159,8 +174,13 @@
         <input type="text" id="node-input-name" placeholder="Name">
     </div>
     <div class="form-row">
+        <label for="node-input-pythonEnvironment"><i class="fa fa-cubes"></i> Environment</label>
+        <input type="text" id="node-input-pythonEnvironment">
+    </div>
+    <div class="form-row" id="pythonPath-row">
         <label for="node-input-pythonPath"><i class="fa fa-cog"></i> Python Path</label>
         <input type="text" id="node-input-pythonPath" placeholder="python3">
+        <div class="form-tips" style="margin-top: 5px;">Fallback path when no environment is selected.</div>
     </div>
     <div class="form-row">
         <label for="node-input-timeout"><i class="fa fa-clock-o"></i> Timeout (ms)</label>
@@ -224,8 +244,11 @@
         <dt>Name <span class="property-type">string</span></dt>
         <dd>Optional name for the node.</dd>
 
+        <dt>Environment <span class="property-type">config</span></dt>
+        <dd>Python environment with isolated packages. Create environments with custom names and manage their packages through the config node UI.</dd>
+
         <dt>Python Path <span class="property-type">string</span></dt>
-        <dd>Path to Python interpreter (default: python3).</dd>
+        <dd>Fallback path to Python interpreter when no environment is selected (default: python3).</dd>
 
         <dt>Timeout <span class="property-type">number</span></dt>
         <dd>Maximum execution time in milliseconds (default: 5000).</dd>

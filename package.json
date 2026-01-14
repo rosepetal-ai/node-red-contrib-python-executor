@@ -25,7 +25,8 @@
   },
   "node-red": {
     "nodes": {
-      "python-executor": "nodes/python-executor.js"
+      "python-executor": "nodes/python-executor.js",
+      "python-environment": "nodes/python-environment.js"
     }
   },
   "dependencies": {},

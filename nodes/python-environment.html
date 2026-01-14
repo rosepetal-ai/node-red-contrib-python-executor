@@ -1,0 +1,659 @@
+<script type="text/javascript">
+    RED.nodes.registerType('python-environment', {
+        category: 'config',
+        defaults: {
+            name: { value: "", required: true }
+        },
+        label: function() {
+            return this.name || "python environment";
+        },
+        oneditprepare: function() {
+            var node = this;
+            var nodeId = this.id;
+            var isNew = !this.name || this.name.trim() === '';
+
+            var $nameInput = $("#node-config-input-name");
+            var $statusArea = $("#env-status-area");
+            var $packageArea = $("#package-management-area");
+            var $packageList = $("#package-list");
+            var $installInput = $("#package-install-input");
+            var $installBtn = $("#package-install-btn");
+            var $refreshBtn = $("#package-refresh-btn");
+            var $progressArea = $("#install-progress-area");
+            var $createBtn = $("#env-create-btn");
+            var $deleteBtn = $("#env-delete-btn");
+
+            // Show/hide sections based on whether environment exists
+            function updateUIState(envValid) {
+                if (envValid) {
+                    $packageArea.show();
+                    $createBtn.hide();
+                    $deleteBtn.show();
+                    $nameInput.prop('disabled', true);
+                } else {
+                    $packageArea.hide();
+                    $createBtn.show();
+                    $deleteBtn.hide();
+                    $nameInput.prop('disabled', false);
+                }
+            }
+
+            // Show status message
+            function showStatus(type, message, details) {
+                $statusArea.removeClass('success error warning info').addClass(type);
+                var html = message;
+                if (details) {
+                    html += '<div class="status-details">' + details + '</div>';
+                }
+                $statusArea.html(html).show();
+            }
+
+            // Detect Python on first load
+            function detectPython() {
+                showStatus('info', '<i class="fa fa-spinner fa-spin"></i> Detecting Python...');
+
+                $.ajax({
+                    url: 'python-environment/detect-python',
+                    type: 'POST',
+                    contentType: 'application/json'
+                }).done(function(response) {
+                    if (response.success) {
+                        showStatus('success',
+                            '<i class="fa fa-check-circle"></i> Python ' + response.version + ' detected',
+                            'Path: <code>' + response.python + '</code>'
+                        );
+                    }
+                }).fail(function(xhr) {
+                    var err = xhr.responseJSON || {};
+                    var details = '';
+
+                    if (err.errorType === 'not_found') {
+                        details = '<strong>Install Python:</strong><br>' +
+                            '• Ubuntu/Debian: <code>sudo apt install python3</code><br>' +
+                            '• macOS: <code>brew install python3</code><br>' +
+                            '• Windows: Download from <a href="https://python.org" target="_blank">python.org</a>';
+                    } else if (err.errorType === 'venv_missing') {
+                        details = '<strong>Install venv module:</strong><br>' +
+                            '• Ubuntu/Debian: <code>sudo apt install python3-venv</code><br>' +
+                            '• Fedora: <code>sudo dnf install python3-venv</code>';
+                    } else if (err.errorType === 'version_too_old') {
+                        details = 'Please upgrade to Python 3.6 or newer.';
+                    }
+
+                    showStatus('error',
+                        '<i class="fa fa-exclamation-triangle"></i> ' + (err.error || 'Python detection failed'),
+                        details
+                    );
+                });
+            }
+
+            // Get current environment name
+            function getEnvName() {
+                return $nameInput.val().trim();
+            }
+
+            // Validate existing environment
+            function validateEnvironment() {
+                var envName = getEnvName();
+                if (!envName) {
+                    detectPython();
+                    updateUIState(false);
+                    return;
+                }
+
+                showStatus('info', '<i class="fa fa-spinner fa-spin"></i> Checking environment...');
+
+                $.ajax({
+                    url: 'python-environment/by-name/' + encodeURIComponent(envName) + '/validate',
+                    type: 'GET'
+                }).done(function(response) {
+                    if (response.valid) {
+                        var versionInfo = response.pythonVersion ? ' (Python ' + response.pythonVersion + ')' : '';
+                        showStatus('success',
+                            '<i class="fa fa-check-circle"></i> Environment already exists' + versionInfo
+                        );
+                        updateUIState(true);
+                        loadPackages();
+                    } else {
+                        showStatus('warning',
+                            '<i class="fa fa-exclamation-circle"></i> Environment not found or invalid',
+                            'Click "Create Environment" to create it.'
+                        );
+                        updateUIState(false);
+                        detectPython();
+                    }
+                }).fail(function() {
+                    detectPython();
+                    updateUIState(false);
+                });
+            }
+
+            // Create environment
+            function createEnvironment() {
+                var name = $nameInput.val().trim();
+                if (!name) {
+                    RED.notify("Please enter an environment name", "warning");
+                    return;
+                }
+
+                $createBtn.prop('disabled', true);
+                showStatus('info', '<i class="fa fa-spinner fa-spin"></i> Creating environment...');
+
+                $.ajax({
+                    url: 'python-environment/create-for-name',
+                    type: 'POST',
+                    contentType: 'application/json',
+                    data: JSON.stringify({ name: name })
+                }).done(function(response) {
+                    if (response.success) {
+                        var msg = response.exists ? 'Environment already exists' : 'Environment created';
+                        var versionInfo = response.pythonVersion ? ' (Python ' + response.pythonVersion + ')' : '';
+                        showStatus('success',
+                            '<i class="fa fa-check-circle"></i> ' + msg + versionInfo
+                        );
+                        updateUIState(true);
+
+                        // If this is a new node, we need to trigger package load after save
+                        if (!isNew) {
+                            loadPackages();
+                        }
+                    }
+                }).fail(function(xhr) {
+                    var err = xhr.responseJSON || {};
+                    showStatus('error',
+                        '<i class="fa fa-exclamation-triangle"></i> ' + (err.error || 'Failed to create environment')
+                    );
+                }).always(function() {
+                    $createBtn.prop('disabled', false);
+                });
+            }
+
+            // Delete environment
+            function deleteEnvironment() {
+                var envName = getEnvName();
+                if (!envName) {
+                    RED.notify("No environment name", "warning");
+                    return;
+                }
+
+                if (!confirm('Are you sure you want to delete this Python environment?\n\nThis will remove all installed packages.')) {
+                    return;
+                }
+
+                $deleteBtn.prop('disabled', true);
+                showStatus('info', '<i class="fa fa-spinner fa-spin"></i> Deleting environment...');
+
+                $.ajax({
+                    url: 'python-environment/by-name/' + encodeURIComponent(envName),
+                    type: 'DELETE'
+                }).done(function() {
+                    showStatus('success', '<i class="fa fa-check-circle"></i> Environment deleted');
+                    updateUIState(false);
+                    $packageList.empty();
+                    $nameInput.prop('disabled', false);
+                    detectPython();
+                }).fail(function(xhr) {
+                    var err = xhr.responseJSON || {};
+                    showStatus('error',
+                        '<i class="fa fa-exclamation-triangle"></i> ' + (err.error || 'Failed to delete environment')
+                    );
+                }).always(function() {
+                    $deleteBtn.prop('disabled', false);
+                });
+            }
+
+            // Load packages
+            function loadPackages() {
+                var envName = getEnvName();
+                if (!envName) {
+                    return;
+                }
+
+                $packageList.html('<div class="package-loading"><i class="fa fa-spinner fa-spin"></i> Loading packages...</div>');
+
+                $.ajax({
+                    url: 'python-environment/by-name/' + encodeURIComponent(envName) + '/packages',
+                    type: 'GET'
+                }).done(function(response) {
+                    renderPackageList(response.packages || []);
+                }).fail(function(xhr) {
+                    var err = xhr.responseJSON || {};
+                    $packageList.html('<div class="package-error">' + (err.error || 'Failed to load packages') + '</div>');
+                });
+            }
+
+            // Render package list
+            function renderPackageList(packages) {
+                $packageList.empty();
+
+                if (!packages || packages.length === 0) {
+                    $packageList.html('<div class="package-empty">No packages installed</div>');
+                    return;
+                }
+
+                packages.forEach(function(pkg) {
+                    var $row = $('<div class="package-row"></div>');
+                    $row.append('<span class="package-name">' + escapeHtml(pkg.name) + '</span>');
+                    $row.append('<span class="package-version">' + escapeHtml(pkg.version) + '</span>');
+
+                    // Don't show uninstall for pip, setuptools, wheel
+                    var protectedPkgs = ['pip', 'setuptools', 'wheel', 'pkg-resources', 'pkg_resources'];
+                    if (protectedPkgs.indexOf(pkg.name.toLowerCase()) === -1) {
+                        var $uninstallBtn = $('<button type="button" class="red-ui-button red-ui-button-small package-uninstall" title="Uninstall"></button>');
+                        $uninstallBtn.append('<i class="fa fa-trash"></i>');
+                        $uninstallBtn.on('click', function() {
+                            uninstallPackage(pkg.name);
+                        });
+                        $row.append($uninstallBtn);
+                    }
+
+                    $packageList.append($row);
+                });
+            }
+
+            // Install package
+            function installPackage() {
+                var envName = getEnvName();
+                if (!envName) {
+                    RED.notify("No environment name", "warning");
+                    return;
+                }
+
+                var packageSpec = $installInput.val().trim();
+                if (!packageSpec) {
+                    RED.notify("Please enter a package name", "warning");
+                    return;
+                }
+
+                $installBtn.prop('disabled', true);
+                $installInput.prop('disabled', true);
+                $progressArea.empty().show();
+
+                // Use fetch for streaming
+                fetch('python-environment/by-name/' + encodeURIComponent(envName) + '/packages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ package: packageSpec })
+                }).then(function(response) {
+                    var reader = response.body.getReader();
+                    var decoder = new TextDecoder();
+                    var buffer = '';
+
+                    function processStream() {
+                        return reader.read().then(function(result) {
+                            if (result.done) {
+                                $installBtn.prop('disabled', false);
+                                $installInput.prop('disabled', false);
+                                loadPackages();
+                                return;
+                            }
+
+                            buffer += decoder.decode(result.value, { stream: true });
+
+                            // Process complete SSE messages
+                            var messages = buffer.split('\n\n');
+                            buffer = messages.pop() || '';
+
+                            messages.forEach(function(msg) {
+                                if (!msg.trim()) return;
+
+                                var eventType = 'message';
+                                var data = null;
+
+                                msg.split('\n').forEach(function(line) {
+                                    if (line.startsWith('event:')) {
+                                        eventType = line.substring(6).trim();
+                                    } else if (line.startsWith('data:')) {
+                                        try {
+                                            data = JSON.parse(line.substring(5).trim());
+                                        } catch (e) {}
+                                    }
+                                });
+
+                                if (data) {
+                                    handleSSEMessage(eventType, data);
+                                }
+                            });
+
+                            return processStream();
+                        });
+                    }
+
+                    return processStream();
+                }).catch(function(err) {
+                    $progressArea.append('<div class="progress-error">Error: ' + escapeHtml(err.message) + '</div>');
+                    $installBtn.prop('disabled', false);
+                    $installInput.prop('disabled', false);
+                });
+            }
+
+            // Handle SSE messages
+            function handleSSEMessage(eventType, data) {
+                if (eventType === 'output') {
+                    var $line = $('<div class="progress-line"></div>');
+                    if (data.type === 'stderr') {
+                        $line.addClass('stderr');
+                    }
+                    $line.text(data.text);
+                    $progressArea.append($line);
+                    $progressArea.scrollTop($progressArea[0].scrollHeight);
+                } else if (eventType === 'complete') {
+                    var $status = $('<div class="progress-status"></div>');
+                    if (data.success) {
+                        $status.addClass('success').text('Installation complete');
+                        $installInput.val('');
+                        RED.notify("Package installed successfully", "success");
+                    } else {
+                        $status.addClass('error').text('Installation failed (exit code: ' + data.code + ')');
+                        RED.notify("Package installation failed", "error");
+                    }
+                    $progressArea.append($status);
+                } else if (eventType === 'error') {
+                    $progressArea.append('<div class="progress-error">Error: ' + escapeHtml(data.message) + '</div>');
+                }
+            }
+
+            // Uninstall package
+            function uninstallPackage(packageName) {
+                var envName = getEnvName();
+                if (!envName) {
+                    RED.notify("No environment name", "warning");
+                    return;
+                }
+
+                if (!confirm('Uninstall ' + packageName + '?')) {
+                    return;
+                }
+
+                showStatus('info', '<i class="fa fa-spinner fa-spin"></i> Uninstalling ' + packageName + '...');
+
+                $.ajax({
+                    url: 'python-environment/by-name/' + encodeURIComponent(envName) + '/packages/' + encodeURIComponent(packageName),
+                    type: 'DELETE'
+                }).done(function() {
+                    RED.notify("Uninstalled " + packageName, "success");
+                    loadPackages();
+                    showStatus('success', '<i class="fa fa-check-circle"></i> Environment ready');
+                }).fail(function(xhr) {
+                    var err = xhr.responseJSON || {};
+                    RED.notify("Failed to uninstall: " + (err.error || 'Unknown error'), "error");
+                    showStatus('error', '<i class="fa fa-exclamation-triangle"></i> ' + (err.error || 'Uninstall failed'));
+                });
+            }
+
+            // Escape HTML
+            function escapeHtml(text) {
+                var div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            // Bind events
+            $createBtn.on('click', createEnvironment);
+            $deleteBtn.on('click', deleteEnvironment);
+            $refreshBtn.on('click', loadPackages);
+            $installBtn.on('click', installPackage);
+            $installInput.on('keypress', function(e) {
+                if (e.which === 13) {
+                    e.preventDefault();
+                    installPackage();
+                }
+            });
+
+            // Initial state - always validate if we have a name
+            var initialName = $nameInput.val().trim();
+            if (initialName) {
+                validateEnvironment();
+            } else {
+                detectPython();
+                updateUIState(false);
+            }
+
+            // Re-validate when name changes (with debounce)
+            var nameChangeTimeout = null;
+            $nameInput.on('input', function() {
+                clearTimeout(nameChangeTimeout);
+                nameChangeTimeout = setTimeout(function() {
+                    var newName = $nameInput.val().trim();
+                    if (newName) {
+                        validateEnvironment();
+                    } else {
+                        updateUIState(false);
+                        $packageList.empty();
+                    }
+                }, 500);
+            });
+        },
+        oneditsave: function() {
+            // Nothing special needed
+        },
+        oneditcancel: function() {
+            // Nothing special needed
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="python-environment">
+    <div class="form-row">
+        <label for="node-config-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-config-input-name" placeholder="my-python-env">
+    </div>
+
+    <div id="env-status-area" class="env-status" style="display: none;"></div>
+
+    <div class="form-row" style="margin-top: 10px;">
+        <button type="button" class="red-ui-button" id="env-create-btn" style="display: none;">
+            <i class="fa fa-plus"></i> Create Environment
+        </button>
+        <button type="button" class="red-ui-button" id="env-delete-btn" style="display: none; margin-left: 5px;">
+            <i class="fa fa-trash"></i> Delete Environment
+        </button>
+    </div>
+
+    <div id="package-management-area" style="display: none; margin-top: 15px;">
+        <div class="form-row" style="margin-bottom: 5px;">
+            <label><i class="fa fa-cube"></i> Installed Packages</label>
+            <button type="button" class="red-ui-button red-ui-button-small" id="package-refresh-btn"
+                    style="float: right;" title="Refresh package list">
+                <i class="fa fa-refresh"></i>
+            </button>
+        </div>
+
+        <div id="package-list" class="package-list"></div>
+
+        <div class="form-row" style="margin-top: 10px;">
+            <label for="package-install-input"><i class="fa fa-plus"></i> Install</label>
+            <div style="display: flex; gap: 5px;">
+                <input type="text" id="package-install-input"
+                       placeholder="numpy, pandas>=1.0, requests"
+                       style="flex: 1;">
+                <button type="button" class="red-ui-button" id="package-install-btn">
+                    <i class="fa fa-download"></i> Install
+                </button>
+            </div>
+        </div>
+
+        <div id="install-progress-area" class="install-progress" style="display: none;"></div>
+    </div>
+</script>
+
+<script type="text/html" data-help-name="python-environment">
+    <p>Manages an isolated Python virtual environment for use with Python Executor nodes.</p>
+
+    <h3>Configuration</h3>
+    <dl class="message-properties">
+        <dt>Name <span class="property-type">string</span></dt>
+        <dd>A unique name for this Python environment. This is used to create the virtual environment directory.</dd>
+    </dl>
+
+    <h3>Package Management</h3>
+    <p>After creating the environment, you can:</p>
+    <ul>
+        <li><strong>View packages</strong>: See all installed packages and their versions</li>
+        <li><strong>Install packages</strong>: Enter package names (supports pip syntax like <code>numpy>=1.20</code>, <code>requests</code>)</li>
+        <li><strong>Uninstall packages</strong>: Remove packages you no longer need</li>
+    </ul>
+
+    <h3>Environment Location</h3>
+    <p>Environments are automatically stored in <code>~/.node-red/python-envs/{name}/</code></p>
+
+    <h3>Requirements</h3>
+    <ul>
+        <li>Python 3.6+ installed and available in PATH</li>
+        <li>The <code>venv</code> module (usually included with Python, but may need <code>python3-venv</code> on Debian/Ubuntu)</li>
+    </ul>
+
+    <h3>Usage</h3>
+    <p>Once created, select this environment in your Python Executor nodes using the "Python Environment" dropdown.</p>
+</script>
+
+<style>
+    /* Status Area */
+    .env-status {
+        padding: 10px 12px;
+        border-radius: 4px;
+        margin: 10px 0;
+        font-size: 13px;
+    }
+
+    .env-status.success {
+        background-color: #dff0d8;
+        border: 1px solid #d6e9c6;
+        color: #3c763d;
+    }
+
+    .env-status.error {
+        background-color: #f2dede;
+        border: 1px solid #ebccd1;
+        color: #a94442;
+    }
+
+    .env-status.warning {
+        background-color: #fcf8e3;
+        border: 1px solid #faebcc;
+        color: #8a6d3b;
+    }
+
+    .env-status.info {
+        background-color: #d9edf7;
+        border: 1px solid #bce8f1;
+        color: #31708f;
+    }
+
+    .env-status code {
+        background: rgba(0,0,0,0.08);
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-size: 12px;
+    }
+
+    .env-status .status-details {
+        margin-top: 8px;
+        font-size: 12px;
+        opacity: 0.9;
+    }
+
+    /* Package List */
+    .package-list {
+        max-height: 200px;
+        overflow-y: auto;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        background: #fff;
+    }
+
+    .package-row {
+        display: flex;
+        align-items: center;
+        padding: 8px 12px;
+        border-bottom: 1px solid #eee;
+    }
+
+    .package-row:last-child {
+        border-bottom: none;
+    }
+
+    .package-row:hover {
+        background: #f5f5f5;
+    }
+
+    .package-name {
+        flex: 1;
+        font-weight: 500;
+        font-size: 13px;
+    }
+
+    .package-version {
+        color: #666;
+        font-size: 12px;
+        margin-right: 10px;
+    }
+
+    .package-uninstall {
+        opacity: 0.6;
+        transition: opacity 0.2s;
+    }
+
+    .package-row:hover .package-uninstall {
+        opacity: 1;
+    }
+
+    .package-loading,
+    .package-empty,
+    .package-error {
+        padding: 20px;
+        text-align: center;
+        color: #666;
+        font-size: 13px;
+    }
+
+    .package-error {
+        color: #a94442;
+    }
+
+    /* Install Progress */
+    .install-progress {
+        max-height: 150px;
+        overflow-y: auto;
+        border: 1px solid #333;
+        border-radius: 4px;
+        padding: 8px;
+        margin-top: 10px;
+        background: #1e1e1e;
+        font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace;
+        font-size: 11px;
+        line-height: 1.4;
+    }
+
+    .progress-line {
+        white-space: pre-wrap;
+        word-break: break-all;
+        color: #d4d4d4;
+    }
+
+    .progress-line.stderr {
+        color: #f48771;
+    }
+
+    .progress-status {
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px solid #444;
+        font-weight: bold;
+    }
+
+    .progress-status.success {
+        color: #4ec9b0;
+    }
+
+    .progress-status.error {
+        color: #f48771;
+    }
+
+    .progress-error {
+        color: #f48771;
+        margin-top: 5px;
+    }
+</style>
