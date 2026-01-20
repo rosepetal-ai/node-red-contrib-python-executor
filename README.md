@@ -1,4 +1,4 @@
-# node-red-contrib-rosepetal-python-executor
+# node-red-contrib-python-executor
 
 Python into your Node-RED flows with a node that feels familiar, stays friendly, and keeps things fast when you need it.
 

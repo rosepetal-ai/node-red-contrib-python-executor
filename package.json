@@ -1,5 +1,5 @@
 {
-  "name": "@rosepetal/node-red-contrib-rosepetal-python-executor",
+  "name": "node-red-contrib-python-executor",
   "version": "1.0.1",
   "description": "A Node-RED node for executing Python code, similar to the function node but for Python",
   "main": "nodes/python-executor.js",
@@ -7,19 +7,18 @@
     "node-red",
     "python",
     "executor",
-    "function",
-    "rosepetal"
+    "function"
   ],
   "author": "Rosepetal SL (https://www.rosepetal.ai)",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rosepetal-ai/node-red-contrib-rosepetal-python-executor.git"
+    "url": "git+https://github.com/rosepetal-ai/node-red-contrib-python-executor.git"
   },
   "bugs": {
-    "url": "https://github.com/rosepetal-ai/node-red-contrib-rosepetal-python-executor/issues"
+    "url": "https://github.com/rosepetal-ai/node-red-contrib-python-executor/issues"
   },
-  "homepage": "https://github.com/rosepetal-ai/node-red-contrib-rosepetal-python-executor#readme",
+  "homepage": "https://github.com/rosepetal-ai/node-red-contrib-python-executor#readme",
   "publishConfig": {
     "access": "public"
   },
