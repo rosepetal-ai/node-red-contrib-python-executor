@@ -1,6 +1,12 @@
 const crypto = require('crypto');
+const fs = require('fs');
 const { spawn } = require('child_process');
 const { PythonWorkerPool } = require('./python-worker');
+
+const MSG_WRAPPER_KEY = "__rosepetal_msg";
+const CONTEXT_WRAPPER_KEY = "__rosepetal_context";
+const SHARED_SENTINEL_KEY = "__rosepetal_shm_path__";
+const SHARED_BASE64_KEY = "__rosepetal_base64__";
 
 // Global worker pools (one per unique configuration)
 // Map key -> { pool: PythonWorkerPool, refCount: number }
@@ -132,6 +138,241 @@ function buildPythonInputMsg(originalMsg, code) {
     return subset;
 }
 
+function extractContextKeysFromCode(code) {
+    const flowKeys = new Set();
+    const globalKeys = new Set();
+
+    if (typeof code !== 'string' || !code.trim()) {
+        return { flow: flowKeys, global: globalKeys };
+    }
+
+    const flowGetRegex = /flow_ctx\.get\(\s*['"]([^'"]+)['"]/g;
+    const flowBracketRegex = /flow_ctx\[['"]([^'"]+)['"]\]/g;
+    const globalGetRegex = /global_ctx\.get\(\s*['"]([^'"]+)['"]/g;
+    const globalBracketRegex = /global_ctx\[['"]([^'"]+)['"]\]/g;
+
+    let match = flowGetRegex.exec(code);
+    while (match) {
+        flowKeys.add(match[1]);
+        match = flowGetRegex.exec(code);
+    }
+
+    match = flowBracketRegex.exec(code);
+    while (match) {
+        flowKeys.add(match[1]);
+        match = flowBracketRegex.exec(code);
+    }
+
+    match = globalGetRegex.exec(code);
+    while (match) {
+        globalKeys.add(match[1]);
+        match = globalGetRegex.exec(code);
+    }
+
+    match = globalBracketRegex.exec(code);
+    while (match) {
+        globalKeys.add(match[1]);
+        match = globalBracketRegex.exec(code);
+    }
+
+    return { flow: flowKeys, global: globalKeys };
+}
+
+function buildPythonContextSnapshot(node, code) {
+    const empty = { flow: {}, global: {} };
+    if (!node || typeof node.context !== 'function') {
+        return empty;
+    }
+
+    const keys = extractContextKeysFromCode(code);
+    const flowKeys = keys.flow;
+    const globalKeys = keys.global;
+
+    if ((!flowKeys || flowKeys.size === 0) && (!globalKeys || globalKeys.size === 0)) {
+        return empty;
+    }
+
+    const context = node.context();
+    if (!context) {
+        return empty;
+    }
+
+    const flowContext = context.flow;
+    const globalContext = context.global;
+    const flowSnapshot = {};
+    const globalSnapshot = {};
+
+    const coerceBufferLike = (value) => {
+        if (!value || typeof value !== 'object') {
+            return value;
+        }
+        if (Buffer.isBuffer(value)) {
+            return value;
+        }
+        if (value.type === 'Buffer' && Array.isArray(value.data)) {
+            return Buffer.from(value.data);
+        }
+        if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+            return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+        }
+        return value;
+    };
+
+    if (flowContext && typeof flowContext.get === 'function') {
+        flowKeys.forEach((key) => {
+            try {
+                flowSnapshot[key] = coerceBufferLike(flowContext.get(key));
+            } catch (err) {
+                // Ignore context read errors to avoid blocking execution
+            }
+        });
+    }
+
+    if (globalContext && typeof globalContext.get === 'function') {
+        globalKeys.forEach((key) => {
+            try {
+                globalSnapshot[key] = coerceBufferLike(globalContext.get(key));
+            } catch (err) {
+                // Ignore context read errors to avoid blocking execution
+            }
+        });
+    }
+
+    return { flow: flowSnapshot, global: globalSnapshot };
+}
+
+function buildPythonPayload(pythonMsg, contextSnapshot) {
+    return {
+        [MSG_WRAPPER_KEY]: pythonMsg,
+        [CONTEXT_WRAPPER_KEY]: contextSnapshot || { flow: {}, global: {} }
+    };
+}
+
+function applyContextUpdates(node, updates, msg) {
+    if (!node || !updates || typeof updates !== 'object' || typeof node.context !== 'function') {
+        return;
+    }
+
+    const context = node.context();
+    if (!context) {
+        return;
+    }
+
+    const flowUpdates = updates.flow && typeof updates.flow === 'object' ? updates.flow : {};
+    const globalUpdates = updates.global && typeof updates.global === 'object' ? updates.global : {};
+
+    const rehydrateSharedValue = (value) => {
+        if (Buffer.isBuffer(value)) {
+            return value;
+        }
+
+        if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
+            return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+        }
+
+        if (Array.isArray(value)) {
+            return value.map((item) => rehydrateSharedValue(item));
+        }
+
+        if (value && typeof value === 'object') {
+            if (value.type === 'Buffer' && Array.isArray(value.data)) {
+                return Buffer.from(value.data);
+            }
+
+            if (Object.prototype.hasOwnProperty.call(value, SHARED_SENTINEL_KEY)) {
+                const filePath = value[SHARED_SENTINEL_KEY];
+                if (!filePath || typeof filePath !== 'string') {
+                    return Buffer.alloc(0);
+                }
+                try {
+                    const data = fs.readFileSync(filePath);
+                    try {
+                        fs.unlinkSync(filePath);
+                    } catch (err) {
+                        if (err && err.code !== 'ENOENT') {
+                            console.error(`Failed to unlink shared memory file ${filePath}:`, err);
+                        }
+                    }
+                    return data;
+                } catch (err) {
+                    console.error(`Failed to read shared memory file ${filePath}:`, err);
+                    return Buffer.alloc(0);
+                }
+            }
+
+            if (Object.prototype.hasOwnProperty.call(value, SHARED_BASE64_KEY)) {
+                try {
+                    return Buffer.from(value[SHARED_BASE64_KEY], 'base64');
+                } catch (err) {
+                    console.error('Failed to decode base64 buffer from context update:', err);
+                    return Buffer.alloc(0);
+                }
+            }
+
+            const obj = Array.isArray(value) ? [] : {};
+            Object.keys(value).forEach((key) => {
+                obj[key] = rehydrateSharedValue(value[key]);
+            });
+            return obj;
+        }
+
+        return value;
+    };
+
+    const hydrateUpdates = (updatesObj) => {
+        const hydrated = {};
+        Object.keys(updatesObj || {}).forEach((key) => {
+            hydrated[key] = rehydrateSharedValue(updatesObj[key]);
+        });
+        return hydrated;
+    };
+
+    const hydratedFlowUpdates = hydrateUpdates(flowUpdates);
+    const hydratedGlobalUpdates = hydrateUpdates(globalUpdates);
+
+    if (context.flow && typeof context.flow.set === 'function') {
+        Object.keys(hydratedFlowUpdates).forEach((key) => {
+            try {
+                context.flow.set(key, hydratedFlowUpdates[key]);
+            } catch (err) {
+                if (typeof node.warn === 'function') {
+                    node.warn(`Failed to set flow context "${key}": ${err.message || err}`, msg);
+                }
+            }
+        });
+    }
+
+    if (context.global && typeof context.global.set === 'function') {
+        Object.keys(hydratedGlobalUpdates).forEach((key) => {
+            try {
+                context.global.set(key, hydratedGlobalUpdates[key]);
+            } catch (err) {
+                if (typeof node.warn === 'function') {
+                    node.warn(`Failed to set global context "${key}": ${err.message || err}`, msg);
+                }
+            }
+        });
+    }
+}
+
+function applyPythonLogs(node, logs, msg) {
+    if (!node || !Array.isArray(logs)) {
+        return;
+    }
+
+    logs.forEach((entry) => {
+        if (!entry) {
+            return;
+        }
+        const message = typeof entry === 'object' && entry.message !== undefined
+            ? String(entry.message)
+            : String(entry);
+        if (typeof node.warn === 'function') {
+            node.warn(message, msg);
+        }
+    });
+}
+
 function buildHotStatusSuffix(pool) {
     const stats = getHotStats(pool);
     if (!stats || typeof stats.total === 'undefined') {
@@ -189,7 +430,7 @@ function flushHotQueue(node, error) {
                 node.error(errObj, entry.msg);
             }
         } else {
-            executeHotMode(node, entry.originalMsg, entry.pythonMsg, entry.send, entry.done, entry.timing);
+            executeHotMode(node, entry.originalMsg, entry.pythonPayload, entry.send, entry.done, entry.timing);
         }
     });
 }
@@ -275,12 +516,12 @@ function attachPoolReadyWatcher(node) {
     node.status({ fill: "grey", shape: "ring", text: "hot: starting" });
 }
 
-function queueHotMessage(node, msg, pythonMsg, send, done, timing) {
+function queueHotMessage(node, msg, pythonPayload, send, done, timing) {
     if (!node.hotPending) {
         node.hotPending = [];
     }
 
-    node.hotPending.push({ originalMsg: msg, pythonMsg, send, done, timing });
+    node.hotPending.push({ originalMsg: msg, pythonPayload, send, done, timing });
     attachPoolReadyWatcher(node);
     if (node.hotMode) {
         node.status({ fill: "grey", shape: "ring", text: "hot: queueing" });
@@ -422,6 +663,8 @@ module.exports = function(RED) {
 
             const timing = { start: process.hrtime.bigint() };
             const pythonMsg = buildPythonInputMsg(msg, node.func);
+            const contextSnapshot = buildPythonContextSnapshot(node, node.func);
+            const pythonPayload = buildPythonPayload(pythonMsg, contextSnapshot);
 
             if (node.hotMode) {
                 const existingPool = node.workerPoolKey ? getWorkerPool(node.workerPoolKey) : null;
@@ -459,13 +702,13 @@ module.exports = function(RED) {
                 const poolReady = typeof node.workerPool.isReady === 'function' ? node.workerPool.isReady() : false;
 
                 if (!poolReady) {
-                    queueHotMessage(node, msg, pythonMsg, send, done, timing);
+                    queueHotMessage(node, msg, pythonPayload, send, done, timing);
                     return;
                 }
 
-                executeHotMode(node, msg, pythonMsg, send, done, timing);
+                executeHotMode(node, msg, pythonPayload, send, done, timing);
             } else {
-                executeColdMode(node, msg, pythonMsg, send, done, timing);
+                executeColdMode(node, msg, pythonPayload, send, done, timing);
             }
         });
 
@@ -497,7 +740,7 @@ module.exports = function(RED) {
     /**
      * Execute Python code in HOT mode (persistent worker)
      */
-    function executeHotMode(node, originalMsg, pythonMsg, send, done, timing) {
+    function executeHotMode(node, originalMsg, pythonPayload, send, done, timing) {
         const startTime = Date.now();
         let timedOut = false;
         let cancelHandle = null;
@@ -530,6 +773,12 @@ module.exports = function(RED) {
             const execTime = Date.now() - startTime;
 
             if (error) {
+                if (error.contextUpdates) {
+                    applyContextUpdates(node, error.contextUpdates, originalMsg);
+                }
+                if (error.logs) {
+                    applyPythonLogs(node, error.logs, originalMsg);
+                }
                 setHotStatus(node, "red", "ring", `hot: error (${execTime}ms)`);
                 logHotStats(node, `Hot execution failed after ${execTime}ms`);
                 const errorMessage = error && (error.message || error.toString());
@@ -539,10 +788,14 @@ module.exports = function(RED) {
 
             let resultData;
             let performanceData = null;
+            let contextUpdates = null;
+            let logs = null;
 
             if (payload && typeof payload === 'object' && Object.prototype.hasOwnProperty.call(payload, 'result')) {
                 resultData = payload.result;
                 performanceData = payload.performance || null;
+                contextUpdates = payload.contextUpdates || null;
+                logs = payload.logs || null;
             } else {
                 resultData = payload;
             }
@@ -559,6 +812,8 @@ module.exports = function(RED) {
             const mergedPerformance = Object.assign({}, performanceData || {});
             mergedPerformance.totalMs = totalMs;
             applyPerformanceMetrics(node, originalMsg, outputMsg, mergedPerformance);
+            applyContextUpdates(node, contextUpdates, originalMsg);
+            applyPythonLogs(node, logs, originalMsg);
 
             // Send output
             send(outputMsg);
@@ -574,7 +829,7 @@ module.exports = function(RED) {
         };
 
         try {
-            cancelHandle = node.workerPool.execute(pythonMsg, node.func, executionCallback, { nodeId: node.workerPoolKey });
+            cancelHandle = node.workerPool.execute(pythonPayload, node.func, executionCallback, { nodeId: node.workerPoolKey });
         } catch (dispatchError) {
             clearTimeout(timeoutId);
             const errObj = dispatchError instanceof Error ? dispatchError : new Error(String(dispatchError));
@@ -593,7 +848,7 @@ module.exports = function(RED) {
     /**
      * Execute Python code in COLD mode (spawn new process)
      */
-    function executeColdMode(node, msg, pythonMsg, send, done, timing) {
+    function executeColdMode(node, msg, pythonPayload, send, done, timing) {
         // Show running status
         node.status({ fill: "blue", shape: "dot", text: "cold: running" });
 
@@ -604,12 +859,90 @@ module.exports = function(RED) {
 import sys
 import json
 import time
+import os
+import base64
+import uuid
+
+MSG_WRAPPER_KEY = "${MSG_WRAPPER_KEY}"
+CONTEXT_WRAPPER_KEY = "${CONTEXT_WRAPPER_KEY}"
+SHARED_SENTINEL_KEY = "${SHARED_SENTINEL_KEY}"
+SHARED_BASE64_KEY = "${SHARED_BASE64_KEY}"
+SHM_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else os.path.abspath(os.getenv("TMPDIR", "/tmp"))
+
+class _ContextProxy:
+    def __init__(self, data=None, updates=None):
+        self._data = data or {}
+        self._updates = updates if updates is not None else {}
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key, value):
+        self._data[key] = value
+        self._updates[key] = value
+
+    def __getitem__(self, key):
+        return self.get(key)
+
+    def __setitem__(self, key, value):
+        self.set(key, value)
+
+class _NodeProxy:
+    def __init__(self, logs=None):
+        self._logs = logs if logs is not None else []
+
+    def warn(self, message):
+        self._logs.append({"level": "warn", "message": str(message)})
+
+def _ensure_shared_dir():
+    try:
+        os.makedirs(SHM_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+def _write_shared_file(data):
+    _ensure_shared_dir()
+    file_path = os.path.join(SHM_DIR, f"rosepetal-python-{os.getpid()}-{uuid.uuid4().hex}")
+    with open(file_path, "wb") as fh:
+        fh.write(data)
+    return file_path
+
+def _encode_shared_outputs(value):
+    if isinstance(value, dict):
+        return {key: _encode_shared_outputs(child) for key, child in value.items()}
+
+    if isinstance(value, list):
+        return [_encode_shared_outputs(item) for item in value]
+
+    if isinstance(value, tuple):
+        return [_encode_shared_outputs(item) for item in value]
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        data = bytes(value)
+        try:
+            file_path = _write_shared_file(data)
+            return {
+                SHARED_SENTINEL_KEY: file_path,
+                "length": len(data)
+            }
+        except OSError:
+            encoded = base64.b64encode(data).decode("ascii") if data else ""
+            return {
+                SHARED_BASE64_KEY: encoded,
+                "length": len(data)
+            }
+
+    return value
 
 transfer_start = time.perf_counter()
 input_data = sys.stdin.read()
 
+flow_updates = {}
+global_updates = {}
+logs = []
+
 try:
-    msg = json.loads(input_data)
+    input_obj = json.loads(input_data)
 except Exception as e:
     error_msg = {
         "error": str(e),
@@ -617,6 +950,20 @@ except Exception as e:
     }
     print(json.dumps(error_msg), file=sys.stderr)
     sys.exit(1)
+
+context_payload = {}
+if isinstance(input_obj, dict) and MSG_WRAPPER_KEY in input_obj:
+    msg = input_obj.get(MSG_WRAPPER_KEY, {})
+    context_payload = input_obj.get(CONTEXT_WRAPPER_KEY) or {}
+else:
+    msg = input_obj
+
+if not isinstance(context_payload, dict):
+    context_payload = {}
+
+flow_ctx = _ContextProxy(context_payload.get("flow") or {}, flow_updates)
+global_ctx = _ContextProxy(context_payload.get("global") or {}, global_updates)
+node = _NodeProxy(logs)
 
 transfer_to_python_ms = (time.perf_counter() - transfer_start) * 1000.0
 execution_ms = 0.0
@@ -633,12 +980,17 @@ try:
     result_obj = result if result is not None else {}
     transfer_back_start = time.perf_counter()
     payload = {
-        "__rosepetal_result": result_obj,
+        "__rosepetal_result": _encode_shared_outputs(result_obj),
         "__rosepetal_performance": {
             "transfer_to_python_ms": transfer_to_python_ms,
             "execution_ms": execution_ms,
             "transfer_to_js_ms": 0.0
-        }
+        },
+        "__rosepetal_context_updates": _encode_shared_outputs({
+            "flow": flow_updates,
+            "global": global_updates
+        }),
+        "__rosepetal_logs": logs
     }
     _ = json.dumps(payload)
     after_dump = time.perf_counter()
@@ -648,7 +1000,12 @@ try:
 except Exception as e:
     error_msg = {
         "error": str(e),
-        "type": type(e).__name__
+        "type": type(e).__name__,
+        "context_updates": _encode_shared_outputs({
+            "flow": flow_updates,
+            "global": global_updates
+        }),
+        "logs": logs
     }
     print(json.dumps(error_msg), file=sys.stderr)
     sys.exit(1)
@@ -690,12 +1047,22 @@ except Exception as e:
                 if (code !== 0) {
                     // Python script failed
                     let errorMessage = 'Python execution failed';
+                    let errorObj = null;
 
                     try {
-                        const errorObj = JSON.parse(stderrData);
-                        errorMessage = `${errorObj.type}: ${errorObj.error}`;
+                        errorObj = JSON.parse(stderrData);
+                        if (errorObj && errorObj.type) {
+                            errorMessage = `${errorObj.type}: ${errorObj.error}`;
+                        }
                     } catch (e) {
                         errorMessage = stderrData || errorMessage;
+                    }
+
+                    if (errorObj) {
+                        const contextUpdates = errorObj.context_updates || errorObj.__rosepetal_context_updates || null;
+                        const logs = errorObj.logs || errorObj.__rosepetal_logs || null;
+                        applyContextUpdates(node, contextUpdates, msg);
+                        applyPythonLogs(node, logs, msg);
                     }
 
                     node.status({ fill: "red", shape: "ring", text: "error" });
@@ -711,10 +1078,14 @@ except Exception as e:
 
                     let resultPayload;
                     let performanceData = null;
+                    let contextUpdates = null;
+                    let logs = null;
 
                     if (rawOutput && typeof rawOutput === 'object' && Object.prototype.hasOwnProperty.call(rawOutput, '__rosepetal_result')) {
                         resultPayload = rawOutput.__rosepetal_result || {};
                         performanceData = rawOutput.__rosepetal_performance || null;
+                        contextUpdates = rawOutput.__rosepetal_context_updates || null;
+                        logs = rawOutput.__rosepetal_logs || null;
                     } else {
                         resultPayload = rawOutput || {};
                     }
@@ -724,6 +1095,8 @@ except Exception as e:
                     const mergedPerformance = Object.assign({}, performanceData || {});
                     mergedPerformance.totalMs = totalMs;
                     applyPerformanceMetrics(node, msg, outputMsg, mergedPerformance);
+                    applyContextUpdates(node, contextUpdates, msg);
+                    applyPythonLogs(node, logs, msg);
 
                     // Send output
                     send(outputMsg);
@@ -755,7 +1128,7 @@ except Exception as e:
 
             // Send input message to Python stdin
             try {
-                const inputJson = JSON.stringify(pythonMsg);
+                const inputJson = JSON.stringify(pythonPayload);
                 pythonProcess.stdin.write(inputJson);
                 pythonProcess.stdin.end();
             } catch (e) {

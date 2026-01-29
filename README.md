@@ -37,6 +37,17 @@ Python into your Node-RED flows with a node that feels familiar, stays friendly,
    ```
 4. Deploy and trigger the flow. Adjust options as needed.
 
+## Context & Warnings
+You can read/write Node-RED context from Python and emit warnings:
+```python
+count = flow_ctx.get("count", 0)
+flow_ctx.set("count", count + 1)
+node.warn(f"count is now {count + 1}")
+return msg
+```
+- Use `flow_ctx` for flow context and `global_ctx` for global context.
+- Context values should be JSON-serializable.
+
 ## Benefits At A Glance
 - **Familiar:** Works just like the standard function node, only in Python.
 - **Flexible:** Supports both simple scripts and larger libraries.

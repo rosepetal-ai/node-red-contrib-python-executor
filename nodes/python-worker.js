@@ -199,13 +199,23 @@ class PythonWorker extends EventEmitter {
             if (response.status === 'success') {
                 const resultPayload = this._rehydrateSharedResult(response.result);
                 const performance = response.performance || null;
-                callback(null, { result: resultPayload, performance });
+                const contextUpdates = response.context_updates
+                    ? this._rehydrateSharedResult(response.context_updates)
+                    : null;
+                const logs = response.logs || null;
+                callback(null, { result: resultPayload, performance, contextUpdates, logs });
             } else {
                 const error = new Error(response.error || 'Unknown error');
                 error.type = response.type;
                 error.traceback = response.traceback;
                 if (response.performance) {
                     error.performance = response.performance;
+                }
+                if (response.context_updates) {
+                    error.contextUpdates = this._rehydrateSharedResult(response.context_updates);
+                }
+                if (response.logs) {
+                    error.logs = response.logs;
                 }
                 callback(error, null);
             }

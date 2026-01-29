@@ -22,6 +22,39 @@ _NODE_GLOBALS: Dict[str, Dict[str, object]] = {}
 SHARED_SENTINEL_KEY = "__rosepetal_shm_path__"
 SHARED_BASE64_KEY = "__rosepetal_base64__"
 SHM_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else os.path.abspath(os.getenv("TMPDIR", "/tmp"))
+MSG_WRAPPER_KEY = "__rosepetal_msg"
+CONTEXT_WRAPPER_KEY = "__rosepetal_context"
+
+
+class _ContextProxy:
+    """Proxy for flow/global context with get/set semantics."""
+
+    def __init__(self, data: Optional[Dict[str, Any]] = None, updates: Optional[Dict[str, Any]] = None):
+        self._data = data or {}
+        self._updates = updates if updates is not None else {}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._data.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        self._data[key] = value
+        self._updates[key] = value
+
+    def __getitem__(self, key: str) -> Any:
+        return self.get(key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.set(key, value)
+
+
+class _NodeProxy:
+    """Proxy for node.warn calls."""
+
+    def __init__(self, logs: Optional[list] = None):
+        self._logs = logs if logs is not None else []
+
+    def warn(self, message: Any) -> None:
+        self._logs.append({"level": "warn", "message": str(message)})
 
 
 def _send_message(payload: Dict[str, object], *, encode_start: Optional[float] = None) -> None:
@@ -197,32 +230,57 @@ def main():
             request = json.loads(json_data)
 
             # Extract message and user code
-            msg = request.get("msg", {})
+            raw_msg = request.get("msg", {})
             user_code = request.get("code", "")
             request_id = request.get("request_id", "unknown")
             node_id = request.get("node_id") or "__default__"
             cache_key = f"{node_id}:{user_code}"
             is_preload = bool(request.get("preload"))
+            context_payload: Any = {}
+
+            if isinstance(raw_msg, dict) and MSG_WRAPPER_KEY in raw_msg:
+                context_payload = raw_msg.get(CONTEXT_WRAPPER_KEY) or {}
+                msg = raw_msg.get(MSG_WRAPPER_KEY, {})
+            else:
+                msg = raw_msg
 
             # Execute user code
             try:
                 msg = _restore_shared_placeholders(msg)
+                context_payload = _restore_shared_placeholders(context_payload)
                 after_restore = time.perf_counter()
                 transfer_to_python_ms = 0.0
                 if transfer_in_start is not None:
                     transfer_to_python_ms = (after_restore - transfer_in_start) * 1000.0
 
                 execution_ms = 0.0
+                context_updates = {"flow": {}, "global": {}}
+                logs = []
+                if isinstance(context_payload, dict):
+                    flow_data = context_payload.get("flow") or {}
+                    global_data = context_payload.get("global") or {}
+                else:
+                    flow_data = {}
+                    global_data = {}
+                flow_ctx = _ContextProxy(flow_data, context_updates["flow"])
+                global_ctx = _ContextProxy(global_data, context_updates["global"])
+                node_proxy = _NodeProxy(logs)
 
                 if is_preload:
                     namespace = _get_namespace(node_id)
+                    namespace["flow_ctx"] = flow_ctx
+                    namespace["global_ctx"] = global_ctx
+                    namespace["node"] = node_proxy
                     exec_start = time.perf_counter()
                     exec(user_code, namespace, namespace)
                     exec_end = time.perf_counter()
                     execution_ms = (exec_end - exec_start) * 1000.0
                     result_object: Any = {}
                 else:
-                    user_function, _ = _get_or_compile(node_id, cache_key, user_code)
+                    user_function, global_namespace = _get_or_compile(node_id, cache_key, user_code)
+                    global_namespace["flow_ctx"] = flow_ctx
+                    global_namespace["global_ctx"] = global_ctx
+                    global_namespace["node"] = node_proxy
 
                     # Call the user function
                     exec_start = time.perf_counter()
@@ -233,6 +291,7 @@ def main():
 
                 transfer_out_start = time.perf_counter()
                 result_object = _encode_shared_outputs(result_object)
+                encoded_context_updates = _encode_shared_outputs(context_updates)
 
                 # Send response
                 response = {
@@ -244,6 +303,8 @@ def main():
                         "execution_ms": execution_ms,
                         "transfer_to_js_ms": 0.0,
                     },
+                    "context_updates": encoded_context_updates,
+                    "logs": logs,
                 }
 
             # Send response (protocol: length\n + json data)
@@ -268,6 +329,8 @@ def main():
                     "type": type(exc).__name__,
                     "traceback": traceback.format_exc(),
                     "performance": error_performance,
+                    "context_updates": _encode_shared_outputs(locals().get("context_updates", {"flow": {}, "global": {}})),
+                    "logs": locals().get("logs", []),
                 }
                 _send_message(response, encode_start=transfer_out_start)
 

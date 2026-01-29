@@ -312,6 +312,16 @@
     <p>You can access message properties like <code>msg['payload']</code>, <code>msg['topic']</code>, etc.</p>
     <p><strong>Important:</strong> Your code must <code>return msg</code> to send it to the next node.</p>
 
+    <h3>Context Access</h3>
+    <p>Use <code>flow_ctx</code> and <code>global_ctx</code> to read/write Node-RED context, and <code>node.warn</code> to log warnings.</p>
+    <p>Context values should be JSON-serializable.</p>
+    <pre>
+count = flow_ctx.get("count", 0)
+flow_ctx.set("count", count + 1)
+node.warn(f"count is now {count + 1}")
+return msg
+    </pre>
+
     <h3>Example</h3>
     <pre>
 # Access the payload
