@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const fs = require('fs');
+const fsp = fs.promises;
 const { spawn } = require('child_process');
 const { PythonWorkerPool } = require('./python-worker');
 
@@ -248,7 +249,7 @@ function buildPythonPayload(pythonMsg, contextSnapshot) {
     };
 }
 
-function applyContextUpdates(node, updates, msg) {
+async function applyContextUpdates(node, updates, msg) {
     if (!node || !updates || typeof updates !== 'object' || typeof node.context !== 'function') {
         return;
     }
@@ -261,7 +262,7 @@ function applyContextUpdates(node, updates, msg) {
     const flowUpdates = updates.flow && typeof updates.flow === 'object' ? updates.flow : {};
     const globalUpdates = updates.global && typeof updates.global === 'object' ? updates.global : {};
 
-    const rehydrateSharedValue = (value) => {
+    const rehydrateSharedValue = async (value) => {
         if (Buffer.isBuffer(value)) {
             return value;
         }
@@ -271,7 +272,7 @@ function applyContextUpdates(node, updates, msg) {
         }
 
         if (Array.isArray(value)) {
-            return value.map((item) => rehydrateSharedValue(item));
+            return Promise.all(value.map((item) => rehydrateSharedValue(item)));
         }
 
         if (value && typeof value === 'object') {
@@ -285,14 +286,12 @@ function applyContextUpdates(node, updates, msg) {
                     return Buffer.alloc(0);
                 }
                 try {
-                    const data = fs.readFileSync(filePath);
-                    try {
-                        fs.unlinkSync(filePath);
-                    } catch (err) {
+                    const data = await fsp.readFile(filePath);
+                    fsp.unlink(filePath).catch((err) => {
                         if (err && err.code !== 'ENOENT') {
                             console.error(`Failed to unlink shared memory file ${filePath}:`, err);
                         }
-                    }
+                    });
                     return data;
                 } catch (err) {
                     console.error(`Failed to read shared memory file ${filePath}:`, err);
@@ -309,9 +308,11 @@ function applyContextUpdates(node, updates, msg) {
                 }
             }
 
-            const obj = Array.isArray(value) ? [] : {};
-            Object.keys(value).forEach((key) => {
-                obj[key] = rehydrateSharedValue(value[key]);
+            const keys = Object.keys(value);
+            const results = await Promise.all(keys.map((key) => rehydrateSharedValue(value[key])));
+            const obj = {};
+            keys.forEach((key, i) => {
+                obj[key] = results[i];
             });
             return obj;
         }
@@ -319,16 +320,20 @@ function applyContextUpdates(node, updates, msg) {
         return value;
     };
 
-    const hydrateUpdates = (updatesObj) => {
+    const hydrateUpdates = async (updatesObj) => {
+        const keys = Object.keys(updatesObj || {});
+        const results = await Promise.all(keys.map((key) => rehydrateSharedValue(updatesObj[key])));
         const hydrated = {};
-        Object.keys(updatesObj || {}).forEach((key) => {
-            hydrated[key] = rehydrateSharedValue(updatesObj[key]);
+        keys.forEach((key, i) => {
+            hydrated[key] = results[i];
         });
         return hydrated;
     };
 
-    const hydratedFlowUpdates = hydrateUpdates(flowUpdates);
-    const hydratedGlobalUpdates = hydrateUpdates(globalUpdates);
+    const [hydratedFlowUpdates, hydratedGlobalUpdates] = await Promise.all([
+        hydrateUpdates(flowUpdates),
+        hydrateUpdates(globalUpdates)
+    ]);
 
     if (context.flow && typeof context.flow.set === 'function') {
         Object.keys(hydratedFlowUpdates).forEach((key) => {
@@ -763,7 +768,7 @@ module.exports = function(RED) {
         }, node.timeout);
 
         // Execute on worker pool
-        const executionCallback = (error, payload) => {
+        const executionCallback = async (error, payload) => {
             if (timedOut) {
                 return;
             }
@@ -774,7 +779,11 @@ module.exports = function(RED) {
 
             if (error) {
                 if (error.contextUpdates) {
-                    applyContextUpdates(node, error.contextUpdates, originalMsg);
+                    try {
+                        await applyContextUpdates(node, error.contextUpdates, originalMsg);
+                    } catch (e) {
+                        node.error(`Failed to apply context updates: ${e.message || e}`, originalMsg);
+                    }
                 }
                 if (error.logs) {
                     applyPythonLogs(node, error.logs, originalMsg);
@@ -812,7 +821,11 @@ module.exports = function(RED) {
             const mergedPerformance = Object.assign({}, performanceData || {});
             mergedPerformance.totalMs = totalMs;
             applyPerformanceMetrics(node, originalMsg, outputMsg, mergedPerformance);
-            applyContextUpdates(node, contextUpdates, originalMsg);
+            try {
+                await applyContextUpdates(node, contextUpdates, originalMsg);
+            } catch (e) {
+                node.error(`Failed to apply context updates: ${e.message || e}`, originalMsg);
+            }
             applyPythonLogs(node, logs, originalMsg);
 
             // Send output
@@ -1037,7 +1050,7 @@ except Exception as e:
             });
 
             // Handle process completion
-            pythonProcess.on('close', (code) => {
+            pythonProcess.on('close', async (code) => {
                 clearTimeout(timeoutId);
 
                 if (timedOut) {
@@ -1061,7 +1074,11 @@ except Exception as e:
                     if (errorObj) {
                         const contextUpdates = errorObj.context_updates || errorObj.__rosepetal_context_updates || null;
                         const logs = errorObj.logs || errorObj.__rosepetal_logs || null;
-                        applyContextUpdates(node, contextUpdates, msg);
+                        try {
+                            await applyContextUpdates(node, contextUpdates, msg);
+                        } catch (e) {
+                            node.error(`Failed to apply context updates: ${e.message || e}`, msg);
+                        }
                         applyPythonLogs(node, logs, msg);
                     }
 
@@ -1095,7 +1112,11 @@ except Exception as e:
                     const mergedPerformance = Object.assign({}, performanceData || {});
                     mergedPerformance.totalMs = totalMs;
                     applyPerformanceMetrics(node, msg, outputMsg, mergedPerformance);
-                    applyContextUpdates(node, contextUpdates, msg);
+                    try {
+                        await applyContextUpdates(node, contextUpdates, msg);
+                    } catch (e) {
+                        node.error(`Failed to apply context updates: ${e.message || e}`, msg);
+                    }
                     applyPythonLogs(node, logs, msg);
 
                     // Send output

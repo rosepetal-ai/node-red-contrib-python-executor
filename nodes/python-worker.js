@@ -1,11 +1,18 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
+const fsp = fs.promises;
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const EventEmitter = require('events');
 
-const SHM_DIR = fs.existsSync('/dev/shm') ? '/dev/shm' : os.tmpdir();
+// Default based on platform
+let SHM_DIR = process.platform === 'linux' ? '/dev/shm' : os.tmpdir();
+if (process.platform === 'linux') {
+    fsp.access('/dev/shm').catch(() => {
+        SHM_DIR = os.tmpdir();
+    });
+}
 const SHARED_SENTINEL_KEY = '__rosepetal_shm_path__';
 const SHARED_BASE64_KEY = '__rosepetal_base64__';
 
@@ -165,11 +172,10 @@ class PythonWorker extends EventEmitter {
     }
 
     /**
-     * Handle a complete response from Python
+     * Handle a complete response from Python.
      */
-    handleResponse(response) {
+    async handleResponse(response) {
         if (response.status === 'ready') {
-            // Worker is ready
             this.ready = true;
             this.emit('ready');
             this.emit('available');
@@ -191,19 +197,25 @@ class PythonWorker extends EventEmitter {
             return;
         }
 
-        // Response to a request
         const requestId = response.request_id;
         const callback = this.pendingCallbacks.get(requestId);
 
+        let callbackError = null;
+        let callbackPayload = null;
+
         if (callback) {
             if (response.status === 'success') {
-                const resultPayload = this._rehydrateSharedResult(response.result);
-                const performance = response.performance || null;
-                const contextUpdates = response.context_updates
-                    ? this._rehydrateSharedResult(response.context_updates)
-                    : null;
-                const logs = response.logs || null;
-                callback(null, { result: resultPayload, performance, contextUpdates, logs });
+                try {
+                    const resultPayload = await this._rehydrateSharedResult(response.result);
+                    const performance = response.performance || null;
+                    const contextUpdates = response.context_updates
+                        ? await this._rehydrateSharedResult(response.context_updates)
+                        : null;
+                    const logs = response.logs || null;
+                    callbackPayload = { result: resultPayload, performance, contextUpdates, logs };
+                } catch (err) {
+                    callbackError = err;
+                }
             } else {
                 const error = new Error(response.error || 'Unknown error');
                 error.type = response.type;
@@ -212,24 +224,37 @@ class PythonWorker extends EventEmitter {
                     error.performance = response.performance;
                 }
                 if (response.context_updates) {
-                    error.contextUpdates = this._rehydrateSharedResult(response.context_updates);
+                    try {
+                        error.contextUpdates = await this._rehydrateSharedResult(response.context_updates);
+                    } catch (_err) {
+
+                    }
                 }
                 if (response.logs) {
                     error.logs = response.logs;
                 }
-                callback(error, null);
+                callbackError = error;
             }
         }
+
+        const attachmentsToCleanup = this.activeAttachments;
+        this.activeAttachments = [];
 
         this.pendingCallbacks.delete(requestId);
         this.busy = false;
         this.activeRequestId = null;
+
+        if (callback) {
+            callback(callbackError, callbackPayload);
+        }
+
         this.emit('available');
-        this._cleanupActiveAttachments();
+
+        this._cleanupAttachments(attachmentsToCleanup);
     }
 
     /**
-     * Execute Python code
+     * Execute Python code.
      */
     execute(msg, code, options = {}, callback) {
         if (!this.ready) {
@@ -245,19 +270,36 @@ class PythonWorker extends EventEmitter {
         this.busy = true;
         const requestId = `req_${this.workerId}_${this.requestCounter++}`;
         this.activeRequestId = requestId;
-
-        // Store callback
         this.pendingCallbacks.set(requestId, callback);
 
-        let preparedPayload;
-        try {
-            preparedPayload = this._prepareSharedPayload(msg);
-        } catch (err) {
+        this._dispatch(requestId, msg, code, options).catch((err) => {
+            if (this.activeRequestId !== requestId) {
+                return;
+            }
+            const cb = this.pendingCallbacks.get(requestId);
+            this.pendingCallbacks.delete(requestId);
+            const attachments = this.activeAttachments;
+            this.activeAttachments = [];
+            this._cleanupAttachments(attachments);
             this.busy = false;
             this.activeRequestId = null;
-            this.pendingCallbacks.delete(requestId);
-            setImmediate(() => callback(err));
-            return null;
+            if (cb) {
+                setImmediate(() => cb(err));
+            }
+        });
+
+        return requestId;
+    }
+
+    /**
+     * Async helper that prepares the payload (parallel shm writes) and sends it.
+     */
+    async _dispatch(requestId, msg, code, options) {
+        const preparedPayload = await this._prepareSharedPayload(msg);
+
+        if (this.activeRequestId !== requestId) {
+            this._cleanupAttachments(preparedPayload.attachments);
+            return;
         }
 
         this.activeAttachments = preparedPayload.attachments;
@@ -270,35 +312,14 @@ class PythonWorker extends EventEmitter {
             preload: options.preload || false
         };
 
-        let requestJson;
-        try {
-            requestJson = JSON.stringify(request);
-        } catch (err) {
-            this._cleanupAttachments(preparedPayload.attachments);
-            this.activeAttachments = [];
-            this.busy = false;
-            this.activeRequestId = null;
-            this.pendingCallbacks.delete(requestId);
-            setImmediate(() => callback(err));
-            return null;
-        }
-
-        // Send request (protocol: length\n + json data)
+        const requestJson = JSON.stringify(request);
         const message = `${requestJson.length}\n${requestJson}`;
 
-        try {
-            this.process.stdin.write(message);
-        } catch (error) {
-            this._cleanupAttachments(preparedPayload.attachments);
-            this.activeAttachments = [];
-            this.busy = false;
-            this.activeRequestId = null;
-            this.pendingCallbacks.delete(requestId);
-            setImmediate(() => callback(error));
-            return null;
+        if (!this.process || !this.process.stdin || !this.process.stdin.writable) {
+            throw new Error('Worker stdin not available');
         }
 
-        return requestId;
+        this.process.stdin.write(message);
     }
 
     /**
@@ -428,27 +449,19 @@ class PythonWorker extends EventEmitter {
     }
 
     /**
-     * Clone message, writing Buffers to shared memory files and replacing them with descriptors
+     * Clone message, writing Buffers to shared memory files and replacing them with descriptors.
+     * Returns a Promise resolving to { msg, attachments }. Buffer writes happen in parallel.
      */
-    _prepareSharedPayload(msg) {
+    async _prepareSharedPayload(msg) {
         const attachments = [];
         const seen = new WeakMap();
+        const pendingBuffers = [];
 
         const cloneValue = (value) => {
             if (Buffer.isBuffer(value)) {
-                try {
-                    const filePath = this._writeBufferToSharedFile(value);
-                    attachments.push(filePath);
-                    return {
-                        [SHARED_SENTINEL_KEY]: filePath,
-                        length: value.length
-                    };
-                } catch (err) {
-                    return {
-                        [SHARED_BASE64_KEY]: value.toString('base64'),
-                        length: value.length
-                    };
-                }
+                const descriptor = { length: value.length };
+                pendingBuffers.push({ buffer: value, descriptor });
+                return descriptor;
             }
 
             if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
@@ -482,6 +495,16 @@ class PythonWorker extends EventEmitter {
 
         const clonedMsg = cloneValue(msg);
 
+        await Promise.all(pendingBuffers.map(async ({ buffer, descriptor }) => {
+            try {
+                const filePath = await this._writeBufferToSharedFile(buffer);
+                descriptor[SHARED_SENTINEL_KEY] = filePath;
+                attachments.push(filePath);
+            } catch (err) {
+                descriptor[SHARED_BASE64_KEY] = buffer.toString('base64');
+            }
+        }));
+
         return {
             msg: clonedMsg,
             attachments
@@ -489,71 +512,74 @@ class PythonWorker extends EventEmitter {
     }
 
     /**
-     * Convert shared-memory descriptors back into Buffers (and process base64 fallbacks)
+     * Convert shared-memory descriptors back into Buffers (and process base64 fallbacks).
+     * Returns a Promise resolving to the rehydrated value. Reads happen in parallel.
      */
-    _rehydrateSharedResult(value) {
-        const revive = (input) => {
-            if (Array.isArray(input)) {
-                return input.map((item) => revive(item));
+    async _rehydrateSharedResult(value) {
+        if (Array.isArray(value)) {
+            return Promise.all(value.map((item) => this._rehydrateSharedResult(item)));
+        }
+
+        if (value && typeof value === 'object') {
+            if (Buffer.isBuffer(value)) {
+                return value;
             }
 
-            if (input && typeof input === 'object') {
-                if (Object.prototype.hasOwnProperty.call(input, SHARED_SENTINEL_KEY)) {
-                    const filePath = input[SHARED_SENTINEL_KEY];
-                    if (!filePath || typeof filePath !== 'string') {
-                        return Buffer.alloc(0);
-                    }
+            if (Object.prototype.hasOwnProperty.call(value, SHARED_SENTINEL_KEY)) {
+                const filePath = value[SHARED_SENTINEL_KEY];
+                if (!filePath || typeof filePath !== 'string') {
+                    return Buffer.alloc(0);
+                }
 
-                    try {
-                        const data = fs.readFileSync(filePath);
-                        try {
-                            fs.unlinkSync(filePath);
-                        } catch (err) {
-                            if (err && err.code !== 'ENOENT') {
-                                console.error(`Failed to unlink shared memory file ${filePath}:`, err);
-                            }
+                try {
+                    const data = await fsp.readFile(filePath);
+                    // Fire-and-forget unlink; ENOENT is benign
+                    fsp.unlink(filePath).catch((err) => {
+                        if (err && err.code !== 'ENOENT') {
+                            console.error(`Failed to unlink shared memory file ${filePath}:`, err);
                         }
-                        return data;
-                    } catch (err) {
-                        console.error(`Failed to read shared memory file ${filePath}:`, err);
-                        return Buffer.alloc(0);
-                    }
+                    });
+                    return data;
+                } catch (err) {
+                    console.error(`Failed to read shared memory file ${filePath}:`, err);
+                    return Buffer.alloc(0);
                 }
-
-                if (Object.prototype.hasOwnProperty.call(input, SHARED_BASE64_KEY)) {
-                    try {
-                        return Buffer.from(input[SHARED_BASE64_KEY], 'base64');
-                    } catch (err) {
-                        console.error('Failed to decode base64 buffer from Python result:', err);
-                        return Buffer.alloc(0);
-                    }
-                }
-
-                const obj = Array.isArray(input) ? [] : {};
-                Object.keys(input).forEach((key) => {
-                    obj[key] = revive(input[key]);
-                });
-                return obj;
             }
 
-            return input;
-        };
+            if (Object.prototype.hasOwnProperty.call(value, SHARED_BASE64_KEY)) {
+                try {
+                    return Buffer.from(value[SHARED_BASE64_KEY], 'base64');
+                } catch (err) {
+                    console.error('Failed to decode base64 buffer from Python result:', err);
+                    return Buffer.alloc(0);
+                }
+            }
 
-        return revive(value);
+            const keys = Object.keys(value);
+            const results = await Promise.all(keys.map((key) => this._rehydrateSharedResult(value[key])));
+            const obj = {};
+            keys.forEach((key, i) => {
+                obj[key] = results[i];
+            });
+            return obj;
+        }
+
+        return value;
     }
 
     /**
      * Write a Buffer to a unique shared memory file
      */
-    _writeBufferToSharedFile(buffer) {
+    async _writeBufferToSharedFile(buffer) {
         const fileName = `rosepetal-python-${process.pid}-${this.workerId}-${Date.now()}-${this.sharedIdSeed}-${crypto.randomBytes(6).toString('hex')}`;
         const filePath = path.join(SHM_DIR, fileName);
-        fs.writeFileSync(filePath, buffer);
+        await fsp.writeFile(filePath, buffer);
         return filePath;
     }
 
     /**
-     * Remove temporary attachments created for the active request
+     * Remove temporary attachments created for the active request.
+     * Fire-and-forget: unlinks asynchronously, ENOENT is treated as benign.
      */
     _cleanupAttachments(paths = []) {
         if (!paths || paths.length === 0) {
@@ -564,13 +590,11 @@ class PythonWorker extends EventEmitter {
             if (!filePath || typeof filePath !== 'string') {
                 return;
             }
-            try {
-                fs.unlinkSync(filePath);
-            } catch (err) {
+            fsp.unlink(filePath).catch((err) => {
                 if (err && err.code !== 'ENOENT') {
                     console.error(`Failed to unlink temporary shared memory file ${filePath}:`, err);
                 }
-            }
+            });
         });
     }
 
