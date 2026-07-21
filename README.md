@@ -48,6 +48,22 @@ return msg
 - Use `flow_ctx` for flow context and `global_ctx` for global context.
 - Context values should be JSON-serializable.
 
+## Working with Images
+Rosepetal images travel as a dict `{data, width, height, channels, colorSpace, dtype}`. Two helpers are injected into every node automatically — no import or boilerplate — so you can round-trip through OpenCV/NumPy:
+
+```python
+import cv2
+
+img = rp_to_cv(msg["payload"])          # -> BGR uint8 ndarray, ready for cv2
+img = cv2.GaussianBlur(img, (7, 7), 0)
+msg["payload"] = rp_from_cv(img, like=msg["payload"])
+return msg
+```
+
+- `rp_to_cv(obj)` returns a NumPy array. RGB/RGBA inputs are reordered to **BGR/BGRA** (OpenCV's convention); grayscale stays 2-D. It honors `colorSpace` and `dtype`, and accepts `data` as raw bytes, a Node Buffer, a list, or base64.
+- `rp_from_cv(arr, like=obj)` returns a Rosepetal image dict. The array is assumed BGR and reordered back to RGB. Pass the source dict as `like=` to preserve its `colorSpace` label.
+- `data` comes back as raw bytes, so it rides the shared-memory fast path in hot mode (no base64 bloat).
+
 ## Benefits At A Glance
 - **Familiar:** Works just like the standard function node, only in Python.
 - **Flexible:** Supports both simple scripts and larger libraries.

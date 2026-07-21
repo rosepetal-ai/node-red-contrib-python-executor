@@ -4,7 +4,7 @@
         color: '#3776AB',
         defaults: {
             name: {value: ""},
-            func: {value: "# This code runs inside a function with 'msg' as parameter\n# You can access msg['payload'], msg['topic'], etc.\n\n# Transform the payload\nmsg['payload'] = msg['payload'] * 2\n\n# Return the modified message\nreturn msg"},
+            func: {value: "# This code runs inside a function with 'msg' as parameter\n# You can access msg['payload'], msg['topic'], etc.\n\n# Transform the payload\nmsg['payload'] = msg['payload'] * 2\n\n# --- Image helpers (available automatically) ---\n# Convert a Rosepetal image to an OpenCV (BGR) array and back:\nimg = rp_to_cv(msg['image'])              # -> numpy BGR array for cv2\n# ... process img with cv2 ...\nmsg['image'] = rp_from_cv(img, like=msg['image'])\n\n# Return the modified message\nreturn msg"},
             timeout: {value: 5000},
             pythonEnvironment: {value: "", type: "python-environment"},
             pythonPath: {value: "python3"},  // Kept for backwards compatibility
@@ -321,6 +321,21 @@ flow_ctx.set("count", count + 1)
 node.warn(f"count is now {count + 1}")
 return msg
     </pre>
+
+    <h3>Working with Images</h3>
+    <p>Rosepetal images travel as a dict <code>{data, width, height, channels, colorSpace, dtype}</code>. Two helpers are injected automatically&mdash;no import needed&mdash;to convert to and from OpenCV/NumPy:</p>
+    <ul>
+        <li><code>rp_to_cv(obj)</code> &rarr; a NumPy array ready for <code>cv2</code>. RGB/RGBA inputs are reordered to <strong>BGR</strong> (OpenCV's convention); grayscale stays 2-D. Honors <code>colorSpace</code> and <code>dtype</code>.</li>
+        <li><code>rp_from_cv(arr, like=obj)</code> &rarr; a Rosepetal image dict. The array is assumed BGR and reordered back to RGB. Pass the original as <code>like=</code> to keep its <code>colorSpace</code>.</li>
+    </ul>
+    <pre>
+import cv2
+img = rp_to_cv(msg['payload'])          # BGR ndarray
+img = cv2.GaussianBlur(img, (7, 7), 0)
+msg['payload'] = rp_from_cv(img, like=msg['payload'])
+return msg
+    </pre>
+    <p>Returned <code>data</code> is raw bytes, so it streams through shared memory automatically in hot mode.</p>
 
     <h3>Example</h3>
     <pre>
