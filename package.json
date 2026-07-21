@@ -1,6 +1,6 @@
 {
   "name": "@rosepetal/node-red-contrib-python-executor",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "A Node-RED node for executing Python code, similar to the function node but for Python",
   "main": "nodes/python-executor.js",
   "keywords": [
