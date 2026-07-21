@@ -64,6 +64,14 @@ class PythonWorker extends EventEmitter {
                     this.emit('error', errObj);
                 });
 
+                // Handle stdin errors (e.g. EPIPE when the child is killed on
+                // timeout while a write is still in flight). Without this
+                // listener the stream throws an uncaught exception and takes
+                // down the whole Node-RED process; report it instead.
+                this.process.stdin.on('error', (err) => {
+                    this.emit('error', new Error(`Worker stdin error: ${err.message}`));
+                });
+
                 // Handle process exit
                 this.process.on('close', (code) => {
                     const wasIntentional = this.intentionalStop;
@@ -319,7 +327,11 @@ class PythonWorker extends EventEmitter {
             throw new Error('Worker stdin not available');
         }
 
-        this.process.stdin.write(message);
+        this.process.stdin.write(message, (err) => {
+            if (err) {
+                this.emit('error', new Error(`Worker stdin write failed: ${err.message}`));
+            }
+        });
     }
 
     /**
@@ -412,6 +424,11 @@ class PythonWorker extends EventEmitter {
 
             currentProcess.once('close', handleClose);
             this.intentionalStop = true;
+            // Close stdin before killing so nothing tries to flush into a
+            // dying pipe (belt-and-braces alongside the stdin error handler).
+            if (currentProcess.stdin && !currentProcess.stdin.destroyed) {
+                currentProcess.stdin.end();
+            }
             currentProcess.kill();
         });
 
