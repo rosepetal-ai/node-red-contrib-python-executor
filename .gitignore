@@ -9,3 +9,7 @@ npm-debug.log*
 *~
 .claude/
 package-lock.json
+
+# Python bytecode from the worker script importing rp_image_helpers
+__pycache__/
+*.pyc

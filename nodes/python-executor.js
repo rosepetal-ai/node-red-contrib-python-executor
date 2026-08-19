@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 const fsp = fs.promises;
 const { spawn } = require('child_process');
 const { PythonWorkerPool } = require('./python-worker');
@@ -8,6 +9,13 @@ const MSG_WRAPPER_KEY = "__rosepetal_msg";
 const CONTEXT_WRAPPER_KEY = "__rosepetal_context";
 const SHARED_SENTINEL_KEY = "__rosepetal_shm_path__";
 const SHARED_BASE64_KEY = "__rosepetal_base64__";
+
+// Cold mode spawns a bare interpreter, so the image helpers have to travel with
+// the generated script. Hot mode imports the same file (python-worker-script.py).
+const RP_IMAGE_HELPERS_SOURCE = fs.readFileSync(
+    path.join(__dirname, 'rp_image_helpers.py'),
+    'utf8'
+);
 
 // Global worker pools (one per unique configuration)
 // Map key -> { pool: PythonWorkerPool, refCount: number }
@@ -980,6 +988,8 @@ node = _NodeProxy(logs)
 
 transfer_to_python_ms = (time.perf_counter() - transfer_start) * 1000.0
 execution_ms = 0.0
+
+${RP_IMAGE_HELPERS_SOURCE}
 
 def user_function(msg):
 ${node.func.split('\n').map(line => '    ' + line).join('\n')}

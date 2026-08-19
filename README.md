@@ -63,6 +63,9 @@ return msg
 - `rp_to_cv(obj)` returns a NumPy array. RGB/RGBA inputs are reordered to **BGR/BGRA** (OpenCV's convention); grayscale stays 2-D. It honors `colorSpace` and `dtype`, and accepts `data` as raw bytes, a Node Buffer, a list, or base64.
 - `rp_from_cv(arr, like=obj)` returns a Rosepetal image dict. The array is assumed BGR and reordered back to RGB. Pass the source dict as `like=` to preserve its `colorSpace` label.
 - `data` comes back as raw bytes, so it rides the shared-memory fast path in hot mode (no base64 bloat).
+- Both helpers work in hot **and** cold mode. Library imports do not: cold mode starts a fresh interpreter per
+  message, so `import cv2` belongs at the top of your code and **Preload Imports** applies to hot mode only.
+  Re-importing numpy + OpenCV costs roughly 100 ms per message, so use hot mode for image work.
 
 ## Benefits At A Glance
 - **Familiar:** Works just like the standard function node, only in Python.
