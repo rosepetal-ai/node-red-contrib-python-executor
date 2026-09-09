@@ -1,14 +1,20 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const fsp = fs.promises;
 const { spawn } = require('child_process');
-const { PythonWorkerPool } = require('./python-worker');
+const { PythonWorkerPool, computeCodeId, readSharedFile } = require('./python-worker');
 
 const MSG_WRAPPER_KEY = "__rosepetal_msg";
 const CONTEXT_WRAPPER_KEY = "__rosepetal_context";
 const SHARED_SENTINEL_KEY = "__rosepetal_shm_path__";
 const SHARED_BASE64_KEY = "__rosepetal_base64__";
+
+// Status updates go to the editor over a websocket and to any Status nodes in
+// the flow; at thousands of messages per second that traffic costs more than
+// the Python call. Updates inside this window are coalesced to the latest one.
+const STATUS_THROTTLE_MS = 50;
+const STATUS_RESET_MS = 3000;
+const EMPTY_CONTEXT = Object.freeze({ flow: Object.freeze({}), global: Object.freeze({}) });
 
 // Cold mode spawns a bare interpreter, so the image helpers have to travel with
 // the generated script. Hot mode imports the same file (python-worker-script.py).
@@ -26,7 +32,7 @@ function getWorkerPoolEntry(key) {
 }
 
 function getWorkerPool(key) {
-    const entry = getWorkerPoolEntry(key);
+    const entry = workerPools.get(key);
     return entry ? entry.pool : null;
 }
 
@@ -84,6 +90,13 @@ function createPoolKey(pythonPath, poolSize, preloadImports, environmentId) {
     return `${envKey}_${poolSize}_${hash}`;
 }
 
+function isTypedArray(value) {
+    return ArrayBuffer.isView(value) && !(value instanceof DataView);
+}
+
+// ---------------------------------------------------------------------------
+// Static code analysis (run once per node, not per message)
+// ---------------------------------------------------------------------------
 function extractMsgKeysFromCode(code) {
     const keys = new Set();
     if (typeof code !== 'string' || !code.trim()) {
@@ -118,33 +131,6 @@ function extractMsgKeysFromCode(code) {
     }
 
     return keys;
-}
-
-function buildPythonInputMsg(originalMsg, code) {
-    if (!originalMsg || typeof originalMsg !== 'object') {
-        return originalMsg;
-    }
-
-    const keys = extractMsgKeysFromCode(code);
-
-    // If we cannot confidently determine keys, fall back to full message
-    if (!keys || keys.size === 0) {
-        return originalMsg;
-    }
-
-    const subset = {};
-    keys.forEach((key) => {
-        if (Object.prototype.hasOwnProperty.call(originalMsg, key)) {
-            subset[key] = originalMsg[key];
-        }
-    });
-
-    // Preserve _msgid for traceability
-    if (Object.prototype.hasOwnProperty.call(originalMsg, '_msgid') && !Object.prototype.hasOwnProperty.call(subset, '_msgid')) {
-        subset._msgid = originalMsg._msgid;
-    }
-
-    return subset;
 }
 
 function extractContextKeysFromCode(code) {
@@ -187,195 +173,259 @@ function extractContextKeysFromCode(code) {
     return { flow: flowKeys, global: globalKeys };
 }
 
-function buildPythonContextSnapshot(node, code) {
-    const empty = { flow: {}, global: {} };
-    if (!node || typeof node.context !== 'function') {
-        return empty;
+// ---------------------------------------------------------------------------
+// Per-message input preparation
+// ---------------------------------------------------------------------------
+function buildPythonInputMsg(originalMsg, msgKeys) {
+    if (!originalMsg || typeof originalMsg !== 'object') {
+        return originalMsg;
     }
 
-    const keys = extractContextKeysFromCode(code);
-    const flowKeys = keys.flow;
-    const globalKeys = keys.global;
+    // If we cannot confidently determine keys, fall back to full message
+    if (!msgKeys || msgKeys.length === 0) {
+        return originalMsg;
+    }
 
-    if ((!flowKeys || flowKeys.size === 0) && (!globalKeys || globalKeys.size === 0)) {
-        return empty;
+    const subset = {};
+    for (let i = 0; i < msgKeys.length; i++) {
+        const key = msgKeys[i];
+        if (Object.prototype.hasOwnProperty.call(originalMsg, key)) {
+            subset[key] = originalMsg[key];
+        }
+    }
+
+    // Preserve _msgid for traceability
+    if (Object.prototype.hasOwnProperty.call(originalMsg, '_msgid') && !Object.prototype.hasOwnProperty.call(subset, '_msgid')) {
+        subset._msgid = originalMsg._msgid;
+    }
+
+    return subset;
+}
+
+function coerceBufferLike(value) {
+    if (!value || typeof value !== 'object') {
+        return value;
+    }
+    if (Buffer.isBuffer(value)) {
+        return value;
+    }
+    if (value.type === 'Buffer' && Array.isArray(value.data)) {
+        return Buffer.from(value.data);
+    }
+    if (isTypedArray(value)) {
+        return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    }
+    return value;
+}
+
+function buildPythonContextSnapshot(node, contextKeys) {
+    if (!contextKeys || (contextKeys.flow.length === 0 && contextKeys.global.length === 0)) {
+        return EMPTY_CONTEXT;
+    }
+    if (!node || typeof node.context !== 'function') {
+        return EMPTY_CONTEXT;
     }
 
     const context = node.context();
     if (!context) {
-        return empty;
+        return EMPTY_CONTEXT;
     }
 
     const flowContext = context.flow;
     const globalContext = context.global;
     const flowSnapshot = {};
     const globalSnapshot = {};
-
-    const coerceBufferLike = (value) => {
-        if (!value || typeof value !== 'object') {
-            return value;
-        }
-        if (Buffer.isBuffer(value)) {
-            return value;
-        }
-        if (value.type === 'Buffer' && Array.isArray(value.data)) {
-            return Buffer.from(value.data);
-        }
-        if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-            return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-        }
-        return value;
-    };
+    const flowKeys = contextKeys.flow;
+    const globalKeys = contextKeys.global;
 
     if (flowContext && typeof flowContext.get === 'function') {
-        flowKeys.forEach((key) => {
+        for (let i = 0; i < flowKeys.length; i++) {
             try {
-                flowSnapshot[key] = coerceBufferLike(flowContext.get(key));
+                flowSnapshot[flowKeys[i]] = coerceBufferLike(flowContext.get(flowKeys[i]));
             } catch (err) {
                 // Ignore context read errors to avoid blocking execution
             }
-        });
+        }
     }
 
     if (globalContext && typeof globalContext.get === 'function') {
-        globalKeys.forEach((key) => {
+        for (let i = 0; i < globalKeys.length; i++) {
             try {
-                globalSnapshot[key] = coerceBufferLike(globalContext.get(key));
+                globalSnapshot[globalKeys[i]] = coerceBufferLike(globalContext.get(globalKeys[i]));
             } catch (err) {
                 // Ignore context read errors to avoid blocking execution
             }
-        });
+        }
     }
 
     return { flow: flowSnapshot, global: globalSnapshot };
 }
 
-function buildPythonPayload(pythonMsg, contextSnapshot) {
-    return {
-        [MSG_WRAPPER_KEY]: pythonMsg,
-        [CONTEXT_WRAPPER_KEY]: contextSnapshot || { flow: {}, global: {} }
-    };
+// ---------------------------------------------------------------------------
+// Result handling
+// ---------------------------------------------------------------------------
+
+/**
+ * Convert transport artefacts inside a value tree back into Buffers, in place:
+ * Buffer-JSON objects, typed arrays, base64 fallbacks and shared-memory files.
+ * Shared files are read asynchronously; a promise that patches the parent is
+ * pushed to `pending`. Returns the replacement for `value` (a Promise when the
+ * value itself is a shared-file descriptor).
+ */
+function hydrateValue(value, pending) {
+    if (value === null || typeof value !== 'object' || Buffer.isBuffer(value)) {
+        return value;
+    }
+    if (isTypedArray(value)) {
+        return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    }
+    if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) {
+            hydrateChild(value, i, pending);
+        }
+        return value;
+    }
+    if (value.type === 'Buffer' && Array.isArray(value.data)) {
+        return Buffer.from(value.data);
+    }
+    if (Object.prototype.hasOwnProperty.call(value, SHARED_SENTINEL_KEY)) {
+        return readSharedFile(value[SHARED_SENTINEL_KEY]);
+    }
+    if (Object.prototype.hasOwnProperty.call(value, SHARED_BASE64_KEY)) {
+        try {
+            return Buffer.from(value[SHARED_BASE64_KEY], 'base64');
+        } catch (err) {
+            console.error('Failed to decode base64 buffer from context update:', err);
+            return Buffer.alloc(0);
+        }
+    }
+    const keys = Object.keys(value);
+    for (let i = 0; i < keys.length; i++) {
+        hydrateChild(value, keys[i], pending);
+    }
+    return value;
 }
 
-async function applyContextUpdates(node, updates, msg) {
-    if (!node || !updates || typeof updates !== 'object' || typeof node.context !== 'function') {
+function hydrateChild(parent, key, pending) {
+    const child = parent[key];
+    if (child === null || typeof child !== 'object') {
         return;
     }
+    const replaced = hydrateValue(child, pending);
+    if (replaced instanceof Promise) {
+        parent[key] = Buffer.alloc(0);
+        pending.push(replaced.then((buffer) => {
+            parent[key] = buffer;
+        }));
+    } else if (replaced !== child) {
+        parent[key] = replaced;
+    }
+}
 
-    const context = node.context();
-    if (!context) {
-        return;
+/**
+ * Apply flow/global context updates returned by Python.
+ * Returns undefined when applied synchronously, or a Promise when values had
+ * to be read from shared memory first.
+ */
+function applyContextUpdates(node, updates, msg) {
+    if (!node || !updates || typeof updates !== 'object' || typeof node.context !== 'function') {
+        return undefined;
     }
 
     const flowUpdates = updates.flow && typeof updates.flow === 'object' ? updates.flow : {};
     const globalUpdates = updates.global && typeof updates.global === 'object' ? updates.global : {};
+    const flowKeys = Object.keys(flowUpdates);
+    const globalKeys = Object.keys(globalUpdates);
 
-    const rehydrateSharedValue = async (value) => {
-        if (Buffer.isBuffer(value)) {
-            return value;
-        }
-
-        if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-            return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-        }
-
-        if (Array.isArray(value)) {
-            return Promise.all(value.map((item) => rehydrateSharedValue(item)));
-        }
-
-        if (value && typeof value === 'object') {
-            if (value.type === 'Buffer' && Array.isArray(value.data)) {
-                return Buffer.from(value.data);
-            }
-
-            if (Object.prototype.hasOwnProperty.call(value, SHARED_SENTINEL_KEY)) {
-                const filePath = value[SHARED_SENTINEL_KEY];
-                if (!filePath || typeof filePath !== 'string') {
-                    return Buffer.alloc(0);
-                }
-                try {
-                    const data = await fsp.readFile(filePath);
-                    fsp.unlink(filePath).catch((err) => {
-                        if (err && err.code !== 'ENOENT') {
-                            console.error(`Failed to unlink shared memory file ${filePath}:`, err);
-                        }
-                    });
-                    return data;
-                } catch (err) {
-                    console.error(`Failed to read shared memory file ${filePath}:`, err);
-                    return Buffer.alloc(0);
-                }
-            }
-
-            if (Object.prototype.hasOwnProperty.call(value, SHARED_BASE64_KEY)) {
-                try {
-                    return Buffer.from(value[SHARED_BASE64_KEY], 'base64');
-                } catch (err) {
-                    console.error('Failed to decode base64 buffer from context update:', err);
-                    return Buffer.alloc(0);
-                }
-            }
-
-            const keys = Object.keys(value);
-            const results = await Promise.all(keys.map((key) => rehydrateSharedValue(value[key])));
-            const obj = {};
-            keys.forEach((key, i) => {
-                obj[key] = results[i];
-            });
-            return obj;
-        }
-
-        return value;
-    };
-
-    const hydrateUpdates = async (updatesObj) => {
-        const keys = Object.keys(updatesObj || {});
-        const results = await Promise.all(keys.map((key) => rehydrateSharedValue(updatesObj[key])));
-        const hydrated = {};
-        keys.forEach((key, i) => {
-            hydrated[key] = results[i];
-        });
-        return hydrated;
-    };
-
-    const [hydratedFlowUpdates, hydratedGlobalUpdates] = await Promise.all([
-        hydrateUpdates(flowUpdates),
-        hydrateUpdates(globalUpdates)
-    ]);
-
-    if (context.flow && typeof context.flow.set === 'function') {
-        Object.keys(hydratedFlowUpdates).forEach((key) => {
-            try {
-                context.flow.set(key, hydratedFlowUpdates[key]);
-            } catch (err) {
-                if (typeof node.warn === 'function') {
-                    node.warn(`Failed to set flow context "${key}": ${err.message || err}`, msg);
-                }
-            }
-        });
+    if (flowKeys.length === 0 && globalKeys.length === 0) {
+        return undefined;
     }
 
-    if (context.global && typeof context.global.set === 'function') {
-        Object.keys(hydratedGlobalUpdates).forEach((key) => {
-            try {
-                context.global.set(key, hydratedGlobalUpdates[key]);
-            } catch (err) {
-                if (typeof node.warn === 'function') {
-                    node.warn(`Failed to set global context "${key}": ${err.message || err}`, msg);
+    const context = node.context();
+    if (!context) {
+        return undefined;
+    }
+
+    const pending = [];
+    for (let i = 0; i < flowKeys.length; i++) {
+        hydrateChild(flowUpdates, flowKeys[i], pending);
+    }
+    for (let i = 0; i < globalKeys.length; i++) {
+        hydrateChild(globalUpdates, globalKeys[i], pending);
+    }
+
+    const apply = () => {
+        const hydratedFlowUpdates = flowUpdates;
+        const hydratedGlobalUpdates = globalUpdates;
+
+        if (context.flow && typeof context.flow.set === 'function') {
+            for (let i = 0; i < flowKeys.length; i++) {
+                const key = flowKeys[i];
+                try {
+                    context.flow.set(key, hydratedFlowUpdates[key]);
+                } catch (err) {
+                    if (typeof node.warn === 'function') {
+                        node.warn(`Failed to set flow context "${key}": ${err.message || err}`, msg);
+                    }
                 }
             }
-        });
+        }
+
+        if (context.global && typeof context.global.set === 'function') {
+            for (let i = 0; i < globalKeys.length; i++) {
+                const key = globalKeys[i];
+                try {
+                    context.global.set(key, hydratedGlobalUpdates[key]);
+                } catch (err) {
+                    if (typeof node.warn === 'function') {
+                        node.warn(`Failed to set global context "${key}": ${err.message || err}`, msg);
+                    }
+                }
+            }
+        }
+    };
+
+    if (pending.length === 0) {
+        apply();
+        return undefined;
+    }
+
+    return Promise.all(pending).then(apply);
+}
+
+/**
+ * Run `fn` after `maybePromise` settles; synchronously when there is nothing to wait for.
+ */
+function afterContextUpdates(node, maybePromise, msg, fn) {
+    if (!maybePromise) {
+        fn();
+        return;
+    }
+    maybePromise
+        .catch((e) => {
+            node.error(`Failed to apply context updates: ${e.message || e}`, msg);
+        })
+        .then(fn);
+}
+
+function tryApplyContextUpdates(node, updates, msg) {
+    try {
+        return applyContextUpdates(node, updates, msg);
+    } catch (e) {
+        node.error(`Failed to apply context updates: ${e.message || e}`, msg);
+        return undefined;
     }
 }
 
 function applyPythonLogs(node, logs, msg) {
-    if (!node || !Array.isArray(logs)) {
+    if (!node || !Array.isArray(logs) || logs.length === 0) {
         return;
     }
 
-    logs.forEach((entry) => {
+    for (let i = 0; i < logs.length; i++) {
+        const entry = logs[i];
         if (!entry) {
-            return;
+            continue;
         }
         const message = typeof entry === 'object' && entry.message !== undefined
             ? String(entry.message)
@@ -383,7 +433,48 @@ function applyPythonLogs(node, logs, msg) {
         if (typeof node.warn === 'function') {
             node.warn(message, msg);
         }
-    });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Status reporting
+// ---------------------------------------------------------------------------
+function createStatusReporter(node) {
+    let lastEmit = 0;
+    let pending = null;
+    let timer = null;
+
+    const flush = () => {
+        timer = null;
+        if (pending) {
+            const build = pending;
+            pending = null;
+            lastEmit = Date.now();
+            node.status(build());
+        }
+    };
+
+    return {
+        report(build) {
+            const now = Date.now();
+            if (timer === null && now - lastEmit >= STATUS_THROTTLE_MS) {
+                lastEmit = now;
+                node.status(build());
+                return;
+            }
+            pending = build;
+            if (timer === null) {
+                timer = setTimeout(flush, Math.max(1, STATUS_THROTTLE_MS - (now - lastEmit)));
+            }
+        },
+        cancel() {
+            if (timer !== null) {
+                clearTimeout(timer);
+                timer = null;
+            }
+            pending = null;
+        }
+    };
 }
 
 function buildHotStatusSuffix(pool) {
@@ -391,23 +482,41 @@ function buildHotStatusSuffix(pool) {
     if (!stats || typeof stats.total === 'undefined') {
         return '';
     }
-    const parts = [];
-    parts.push(`workers ${stats.total}`);
+    let suffix = ` (workers ${stats.total}`;
     if (typeof stats.busy === 'number') {
-        parts.push(`busy ${stats.busy}`);
+        suffix += `, busy ${stats.busy}`;
     }
     if (typeof stats.queue === 'number') {
-        parts.push(`queue ${stats.queue}`);
+        suffix += `, queue ${stats.queue}`;
     }
-    return ` (${parts.join(', ')})`;
+    return suffix + ')';
+}
+
+function reportStatus(node, fill, shape, text) {
+    if (!node || !node._statusReporter) {
+        return;
+    }
+    node._statusReporter.report(() => ({ fill, shape, text }));
 }
 
 function setHotStatus(node, fill, shape, text) {
-    if (!node) {
+    if (!node || !node._statusReporter) {
         return;
     }
-    const suffix = node.hotMode ? buildHotStatusSuffix(node.workerPool) : '';
-    node.status({ fill, shape, text: suffix ? `${text}${suffix}` : text });
+    node._statusReporter.report(() => {
+        const suffix = node.hotMode ? buildHotStatusSuffix(node.workerPool) : '';
+        return { fill, shape, text: suffix ? `${text}${suffix}` : text };
+    });
+}
+
+function scheduleStatusReset(node, reset) {
+    if (node._statusResetTimer) {
+        clearTimeout(node._statusResetTimer);
+    }
+    node._statusResetTimer = setTimeout(() => {
+        node._statusResetTimer = null;
+        reset();
+    }, STATUS_RESET_MS);
 }
 
 function logHotStats(node, message) {
@@ -422,6 +531,9 @@ function logHotStats(node, message) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hot pool readiness handling
+// ---------------------------------------------------------------------------
 function flushHotQueue(node, error) {
     if (!node || !node.hotPending || node.hotPending.length === 0) {
         return;
@@ -443,7 +555,7 @@ function flushHotQueue(node, error) {
                 node.error(errObj, entry.msg);
             }
         } else {
-            executeHotMode(node, entry.originalMsg, entry.pythonPayload, entry.send, entry.done, entry.timing);
+            executeHotMode(node, entry.originalMsg, entry.pythonMsg, entry.contextSnapshot, entry.send, entry.done, entry.timing);
         }
     });
 }
@@ -502,7 +614,7 @@ function attachPoolReadyWatcher(node) {
             detachPoolReadyWatcher(node);
             node.useHot = false;
             node.hotError = error instanceof Error ? error : new Error(String(error));
-            node.status({ fill: "red", shape: "ring", text: "hot: failed" });
+            reportStatus(node, "red", "ring", "hot: failed");
             const message = error && error.message ? error.message : String(error);
             node.error(`Hot worker pool failed to start: ${message}`);
             flushHotQueue(node, node.hotError);
@@ -517,7 +629,7 @@ function attachPoolReadyWatcher(node) {
         node.poolReloadHandler = () => {
             node.useHot = false;
             node.hotError = null;
-            node.status({ fill: "grey", shape: "ring", text: "hot: reloading" });
+            reportStatus(node, "grey", "ring", "hot: reloading");
             attachPoolReadyWatcher(node);
         };
 
@@ -526,21 +638,24 @@ function attachPoolReadyWatcher(node) {
         }
     }
 
-    node.status({ fill: "grey", shape: "ring", text: "hot: starting" });
+    reportStatus(node, "grey", "ring", "hot: starting");
 }
 
-function queueHotMessage(node, msg, pythonPayload, send, done, timing) {
+function queueHotMessage(node, msg, pythonMsg, contextSnapshot, send, done, timing) {
     if (!node.hotPending) {
         node.hotPending = [];
     }
 
-    node.hotPending.push({ originalMsg: msg, pythonPayload, send, done, timing });
+    node.hotPending.push({ originalMsg: msg, pythonMsg, contextSnapshot, send, done, timing });
     attachPoolReadyWatcher(node);
     if (node.hotMode) {
-        node.status({ fill: "grey", shape: "ring", text: "hot: queueing" });
+        reportStatus(node, "grey", "ring", "hot: queueing");
     }
 }
 
+// ---------------------------------------------------------------------------
+// Performance metrics
+// ---------------------------------------------------------------------------
 function normalizePerformanceValue(value) {
     const numeric = Number(value);
     return Number.isFinite(numeric) ? numeric : 0;
@@ -588,295 +703,11 @@ function applyPerformanceMetrics(node, originalMsg, targetMsg, performance) {
     targetMsg.performance = collected;
 }
 
-module.exports = function(RED) {
-    function PythonExecutorNode(config) {
-        RED.nodes.createNode(this, config);
-        const node = this;
-
-        // Configuration
-        node.func = config.func || "";
-        node.outputs = 1;
-        node.timeout = config.timeout || 5000;
-
-        // Get pythonPath from environment config node or use direct path
-        node.pythonEnvironmentId = null;
-        if (config.pythonEnvironment) {
-            const envNode = RED.nodes.getNode(config.pythonEnvironment);
-            if (envNode && envNode.pythonPath) {
-                node.pythonPath = envNode.pythonPath;
-                node.pythonEnvironmentId = config.pythonEnvironment;
-            } else {
-                node.warn("Python environment not found, using fallback");
-                node.pythonPath = config.pythonPath || "python3";
-            }
-        } else {
-            node.pythonPath = config.pythonPath || "python3";
-        }
-        node.hotMode = config.hotMode !== undefined ? config.hotMode : false;
-        node.workerPoolSize = config.workerPoolSize || 1;
-        node.preloadImports = (config.preloadImports || "").trim();
-        node.useHot = !!node.hotMode;
-        node.hotError = null;
-
-        // Worker pool management (hot mode)
-        node.workerPool = null;
-        node.workerPoolKey = null;
-        node.hotPending = [];
-        node.poolReadyHandler = null;
-        node.poolErrorHandler = null;
-        node.poolReloadHandler = null;
-        node.poolRefAcquired = false;
-
-        // Initialize worker pool if hot mode is enabled
-        let poolCreated = false;
-
-        if (node.hotMode) {
-            node.workerPoolKey = createPoolKey(node.pythonPath, node.workerPoolSize, node.preloadImports, node.pythonEnvironmentId);
-
-            const poolResult = acquireWorkerPool(node.workerPoolKey, node.pythonPath, node.workerPoolSize, node.preloadImports);
-            node.workerPool = poolResult.pool;
-            node.poolRefAcquired = true;
-            poolCreated = poolResult.created;
-
-            if (poolCreated) {
-                node.workerPool.initialize()
-                    .then(() => {
-                        if (node.preloadImports && node.preloadImports.trim()) {
-                            node.log(`Hot mode preloaded imports executed for ${node.workerPoolSize} worker(s)`);
-                        }
-                        node.log(`Hot mode enabled: ${node.workerPoolSize} worker(s) ready (python: ${node.pythonPath})`);
-                    })
-                    .catch((error) => {
-                        node.error(`Failed to initialize worker pool: ${error.message}`);
-                        node.status({ fill: "yellow", shape: "ring", text: "hot: disabled" });
-                        detachPoolReadyWatcher(node);
-                        node.workerPool = null;
-                        node.useHot = false;
-                        node.hotError = error instanceof Error ? error : new Error(String(error));
-                        flushHotQueue(node, node.hotError);
-                        node.poolRefAcquired = false;
-                        releaseWorkerPool(node.workerPoolKey);
-                    });
-            } else if (node.workerPool) {
-                node.log(`Hot mode using existing worker pool (python: ${node.pythonPath}, workers: ${node.workerPoolSize})`);
-            }
-
-            attachPoolReadyWatcher(node);
-        }
-
-        // Handle incoming messages
-        node.on('input', function(msg, send, done) {
-            // For Node-RED 0.x compatibility
-            send = send || function() { node.send.apply(node, arguments); };
-            done = done || function(err) {
-                if (err) {
-                    node.error(err, msg);
-                }
-            };
-
-            const timing = { start: process.hrtime.bigint() };
-            const pythonMsg = buildPythonInputMsg(msg, node.func);
-            const contextSnapshot = buildPythonContextSnapshot(node, node.func);
-            const pythonPayload = buildPythonPayload(pythonMsg, contextSnapshot);
-
-            if (node.hotMode) {
-                const existingPool = node.workerPoolKey ? getWorkerPool(node.workerPoolKey) : null;
-                if (existingPool && node.workerPool !== existingPool) {
-                    detachPoolReadyWatcher(node);
-                    node.workerPool = existingPool;
-                    node.hotError = null;
-                    node.useHot = true;
-                }
-
-                if (node.workerPool) {
-                    if (typeof node.workerPool.isReady === 'function' && node.workerPool.isReady()) {
-                        node.hotError = null;
-                        node.useHot = true;
-                    }
-                    attachPoolReadyWatcher(node);
-                }
-            }
-
-            if (node.hotMode && node.hotError) {
-                const poolReady = node.workerPool && typeof node.workerPool.isReady === 'function' ? node.workerPool.isReady() : false;
-                if (poolReady) {
-                    node.hotError = null;
-                    node.useHot = true;
-                } else {
-                    const errObj = node.hotError instanceof Error ? node.hotError : new Error(String(node.hotError));
-                    node.status({ fill: "red", shape: "ring", text: "hot: failed" });
-                    done(errObj);
-                    return;
-                }
-            }
-
-            // Choose execution mode
-            if (node.useHot && node.workerPool) {
-                const poolReady = typeof node.workerPool.isReady === 'function' ? node.workerPool.isReady() : false;
-
-                if (!poolReady) {
-                    queueHotMessage(node, msg, pythonPayload, send, done, timing);
-                    return;
-                }
-
-                executeHotMode(node, msg, pythonPayload, send, done, timing);
-            } else {
-                executeColdMode(node, msg, pythonPayload, send, done, timing);
-            }
-        });
-
-        // Clean up on node close
-        node.on('close', function(removed, done) {
-            detachPoolReadyWatcher(node);
-            node.hotPending = [];
-            node.useHot = false;
-            node.status({});
-
-            const finish = (typeof done === 'function') ? done : (typeof removed === 'function' ? removed : () => {});
-
-            const releasePromise = (node.poolRefAcquired && node.workerPoolKey)
-                ? releaseWorkerPool(node.workerPoolKey)
-                : Promise.resolve();
-
-            node.poolRefAcquired = false;
-
-            if (releasePromise && typeof releasePromise.then === 'function') {
-                releasePromise
-                    .then(() => finish())
-                    .catch(() => finish());
-            } else {
-                finish();
-            }
-        });
-    }
-
-    /**
-     * Execute Python code in HOT mode (persistent worker)
-     */
-    function executeHotMode(node, originalMsg, pythonPayload, send, done, timing) {
-        const startTime = Date.now();
-        let timedOut = false;
-        let cancelHandle = null;
-        const updateRunningStatus = () => {
-            setHotStatus(node, "blue", "dot", "hot: running");
-            logHotStats(node, 'Dispatching message to hot worker');
-        };
-
-        // Set timeout
-        const timeoutId = setTimeout(() => {
-            timedOut = true;
-            setHotStatus(node, "red", "ring", "hot: timeout");
-            logHotStats(node, 'Hot execution timed out');
-
-            if (cancelHandle && typeof cancelHandle.cancel === 'function') {
-                cancelHandle.cancel('Python execution timed out');
-            }
-
-            done(new Error(`Python execution timed out after ${node.timeout}ms`));
-        }, node.timeout);
-
-        // Execute on worker pool
-        const executionCallback = async (error, payload) => {
-            if (timedOut) {
-                return;
-            }
-
-            clearTimeout(timeoutId);
-
-            const execTime = Date.now() - startTime;
-
-            if (error) {
-                if (error.contextUpdates) {
-                    try {
-                        await applyContextUpdates(node, error.contextUpdates, originalMsg);
-                    } catch (e) {
-                        node.error(`Failed to apply context updates: ${e.message || e}`, originalMsg);
-                    }
-                }
-                if (error.logs) {
-                    applyPythonLogs(node, error.logs, originalMsg);
-                }
-                setHotStatus(node, "red", "ring", `hot: error (${execTime}ms)`);
-                logHotStats(node, `Hot execution failed after ${execTime}ms`);
-                const errorMessage = error && (error.message || error.toString());
-                done(new Error(`${error.type || 'Error'}: ${errorMessage}`));
-                return;
-            }
-
-            let resultData;
-            let performanceData = null;
-            let contextUpdates = null;
-            let logs = null;
-
-            if (payload && typeof payload === 'object' && Object.prototype.hasOwnProperty.call(payload, 'result')) {
-                resultData = payload.result;
-                performanceData = payload.performance || null;
-                contextUpdates = payload.contextUpdates || null;
-                logs = payload.logs || null;
-            } else {
-                resultData = payload;
-            }
-
-            if (resultData === undefined || resultData === null) {
-                resultData = {};
-            }
-
-            const totalMs = hrtimeDiffToMs(timing && timing.start);
-
-            // Merge result into original message
-            const outputMsg = Object.assign({}, originalMsg, resultData || {});
-
-            const mergedPerformance = Object.assign({}, performanceData || {});
-            mergedPerformance.totalMs = totalMs;
-            applyPerformanceMetrics(node, originalMsg, outputMsg, mergedPerformance);
-            try {
-                await applyContextUpdates(node, contextUpdates, originalMsg);
-            } catch (e) {
-                node.error(`Failed to apply context updates: ${e.message || e}`, originalMsg);
-            }
-            applyPythonLogs(node, logs, originalMsg);
-
-            // Send output
-            send(outputMsg);
-            setHotStatus(node, "green", "dot", `hot: ${execTime}ms`);
-            logHotStats(node, `Hot execution completed in ${execTime}ms`);
-
-            // Clear status after 3 seconds
-            setTimeout(() => {
-                setHotStatus(node, "green", "dot", "hot: ready");
-            }, 3000);
-
-            done();
-        };
-
-        try {
-            cancelHandle = node.workerPool.execute(pythonPayload, node.func, executionCallback, { nodeId: node.workerPoolKey });
-        } catch (dispatchError) {
-            clearTimeout(timeoutId);
-            const errObj = dispatchError instanceof Error ? dispatchError : new Error(String(dispatchError));
-            setHotStatus(node, "red", "ring", "hot: dispatch failed");
-            done(errObj);
-            return;
-        }
-
-        updateRunningStatus();
-
-        if (!cancelHandle || typeof cancelHandle.cancel !== 'function') {
-            cancelHandle = null;
-        }
-    }
-
-    /**
-     * Execute Python code in COLD mode (spawn new process)
-     */
-    function executeColdMode(node, msg, pythonPayload, send, done, timing) {
-        // Show running status
-        node.status({ fill: "blue", shape: "dot", text: "cold: running" });
-
-        const startTime = Date.now();
-
-        // Prepare Python script
-        const pythonScript = `
+// ---------------------------------------------------------------------------
+// Cold mode script (built once per node)
+// ---------------------------------------------------------------------------
+function buildColdScript(func) {
+    return `
 import sys
 import json
 import time
@@ -992,7 +823,7 @@ execution_ms = 0.0
 ${RP_IMAGE_HELPERS_SOURCE}
 
 def user_function(msg):
-${node.func.split('\n').map(line => '    ' + line).join('\n')}
+${func.trim() ? func.split('\n').map(line => '    ' + line).join('\n') : '    pass'}
 
 try:
     exec_start = time.perf_counter()
@@ -1033,141 +864,524 @@ except Exception as e:
     print(json.dumps(error_msg), file=sys.stderr)
     sys.exit(1)
 `;
+}
 
-            // Spawn Python process
-            const pythonProcess = spawn(node.pythonPath, ['-c', pythonScript]);
+module.exports = function(RED) {
+    function PythonExecutorNode(config) {
+        RED.nodes.createNode(this, config);
+        const node = this;
 
-            let stdoutData = '';
-            let stderrData = '';
-            let timedOut = false;
+        // Configuration
+        node.func = config.func || "";
+        node.outputs = 1;
+        node.timeout = config.timeout || 5000;
 
-            // Set timeout
-            const timeoutId = setTimeout(() => {
-                timedOut = true;
-                pythonProcess.kill();
-                node.status({ fill: "red", shape: "ring", text: "timeout" });
-                done(new Error(`Python execution timed out after ${node.timeout}ms`));
-            }, node.timeout);
+        // Get pythonPath from environment config node or use direct path
+        node.pythonEnvironmentId = null;
+        if (config.pythonEnvironment) {
+            const envNode = RED.nodes.getNode(config.pythonEnvironment);
+            if (envNode && envNode.pythonPath) {
+                node.pythonPath = envNode.pythonPath;
+                node.pythonEnvironmentId = config.pythonEnvironment;
+            } else {
+                node.warn("Python environment not found, using fallback");
+                node.pythonPath = config.pythonPath || "python3";
+            }
+        } else {
+            node.pythonPath = config.pythonPath || "python3";
+        }
+        node.hotMode = config.hotMode !== undefined ? config.hotMode : false;
+        node.workerPoolSize = config.workerPoolSize || 1;
+        node.preloadImports = (config.preloadImports || "").trim();
+        node.useHot = !!node.hotMode;
+        node.hotError = null;
 
-            // Collect stdout
-            pythonProcess.stdout.on('data', (data) => {
-                stdoutData += data.toString();
-            });
+        // The code is fixed for the node's lifetime: analyse it once here
+        // instead of running the regexes on every message.
+        node._msgKeys = Array.from(extractMsgKeysFromCode(node.func));
+        const contextKeys = extractContextKeysFromCode(node.func);
+        node._contextKeys = { flow: Array.from(contextKeys.flow), global: Array.from(contextKeys.global) };
+        node._coldScript = null;
+        node._codeId = null;
+        node._statusReporter = createStatusReporter(node);
+        node._statusResetTimer = null;
 
-            // Collect stderr
-            pythonProcess.stderr.on('data', (data) => {
-                stderrData += data.toString();
-            });
+        // Worker pool management (hot mode)
+        node.workerPool = null;
+        node.workerPoolKey = null;
+        node.hotPending = [];
+        node.poolReadyHandler = null;
+        node.poolErrorHandler = null;
+        node.poolReloadHandler = null;
+        node.poolRefAcquired = false;
 
-            // Handle process completion
-            pythonProcess.on('close', async (code) => {
-                clearTimeout(timeoutId);
+        // Initialize worker pool if hot mode is enabled
+        let poolCreated = false;
 
-                if (timedOut) {
-                    return; // Already handled by timeout
+        if (node.hotMode) {
+            node.workerPoolKey = createPoolKey(node.pythonPath, node.workerPoolSize, node.preloadImports, node.pythonEnvironmentId);
+            node._codeId = computeCodeId(node.workerPoolKey, node.func);
+
+            const poolResult = acquireWorkerPool(node.workerPoolKey, node.pythonPath, node.workerPoolSize, node.preloadImports);
+            node.workerPool = poolResult.pool;
+            node.poolRefAcquired = true;
+            poolCreated = poolResult.created;
+
+            if (poolCreated) {
+                node.workerPool.initialize()
+                    .then(() => {
+                        if (node.preloadImports && node.preloadImports.trim()) {
+                            node.log(`Hot mode preloaded imports executed for ${node.workerPoolSize} worker(s)`);
+                        }
+                        node.log(`Hot mode enabled: ${node.workerPoolSize} worker(s) ready (python: ${node.pythonPath})`);
+                    })
+                    .catch((error) => {
+                        node.error(`Failed to initialize worker pool: ${error.message}`);
+                        reportStatus(node, "yellow", "ring", "hot: disabled");
+                        detachPoolReadyWatcher(node);
+                        node.workerPool = null;
+                        node.useHot = false;
+                        node.hotError = error instanceof Error ? error : new Error(String(error));
+                        flushHotQueue(node, node.hotError);
+                        node.poolRefAcquired = false;
+                        releaseWorkerPool(node.workerPoolKey);
+                    });
+            } else if (node.workerPool) {
+                node.log(`Hot mode using existing worker pool (python: ${node.pythonPath}, workers: ${node.workerPoolSize})`);
+            }
+
+            attachPoolReadyWatcher(node);
+        }
+
+        // Handle incoming messages
+        node.on('input', function(msg, send, done) {
+            // For Node-RED 0.x compatibility
+            send = send || function() { node.send.apply(node, arguments); };
+            done = done || function(err) {
+                if (err) {
+                    node.error(err, msg);
                 }
+            };
 
-                if (code !== 0) {
-                    // Python script failed
-                    let errorMessage = 'Python execution failed';
-                    let errorObj = null;
+            const timing = { start: process.hrtime.bigint() };
+            const pythonMsg = buildPythonInputMsg(msg, node._msgKeys);
+            const contextSnapshot = buildPythonContextSnapshot(node, node._contextKeys);
 
-                    try {
-                        errorObj = JSON.parse(stderrData);
-                        if (errorObj && errorObj.type) {
-                            errorMessage = `${errorObj.type}: ${errorObj.error}`;
-                        }
-                    } catch (e) {
-                        errorMessage = stderrData || errorMessage;
+            if (node.hotMode) {
+                // Fast path: pool attached, ready and current.
+                if (node.useHot && node.workerPool && node.workerPool.ready === true
+                    && (node.workerPoolKey === null || getWorkerPool(node.workerPoolKey) === node.workerPool)) {
+                    node.hotError = null;
+                    if (node.hotPending.length > 0) {
+                        flushHotQueue(node);
                     }
-
-                    if (errorObj) {
-                        const contextUpdates = errorObj.context_updates || errorObj.__rosepetal_context_updates || null;
-                        const logs = errorObj.logs || errorObj.__rosepetal_logs || null;
-                        try {
-                            await applyContextUpdates(node, contextUpdates, msg);
-                        } catch (e) {
-                            node.error(`Failed to apply context updates: ${e.message || e}`, msg);
-                        }
-                        applyPythonLogs(node, logs, msg);
-                    }
-
-                    node.status({ fill: "red", shape: "ring", text: "error" });
-                    done(new Error(errorMessage));
+                    executeHotMode(node, msg, pythonMsg, contextSnapshot, send, done, timing);
                     return;
                 }
 
-                // Parse output
+                const existingPool = node.workerPoolKey ? getWorkerPool(node.workerPoolKey) : null;
+                if (existingPool && node.workerPool !== existingPool) {
+                    detachPoolReadyWatcher(node);
+                    node.workerPool = existingPool;
+                    node.hotError = null;
+                    node.useHot = true;
+                }
+
+                if (node.workerPool) {
+                    if (typeof node.workerPool.isReady === 'function' && node.workerPool.isReady()) {
+                        node.hotError = null;
+                        node.useHot = true;
+                    }
+                    attachPoolReadyWatcher(node);
+                }
+            }
+
+            if (node.hotMode && node.hotError) {
+                const poolReady = node.workerPool && typeof node.workerPool.isReady === 'function' ? node.workerPool.isReady() : false;
+                if (poolReady) {
+                    node.hotError = null;
+                    node.useHot = true;
+                } else {
+                    const errObj = node.hotError instanceof Error ? node.hotError : new Error(String(node.hotError));
+                    reportStatus(node, "red", "ring", "hot: failed");
+                    done(errObj);
+                    return;
+                }
+            }
+
+            // Choose execution mode
+            if (node.useHot && node.workerPool) {
+                const poolReady = typeof node.workerPool.isReady === 'function' ? node.workerPool.isReady() : false;
+
+                if (!poolReady) {
+                    queueHotMessage(node, msg, pythonMsg, contextSnapshot, send, done, timing);
+                    return;
+                }
+
+                executeHotMode(node, msg, pythonMsg, contextSnapshot, send, done, timing);
+            } else {
+                executeColdMode(node, msg, pythonMsg, contextSnapshot, send, done, timing);
+            }
+        });
+
+        // Clean up on node close
+        node.on('close', function(removed, done) {
+            detachPoolReadyWatcher(node);
+            node.hotPending = [];
+            node.useHot = false;
+            if (node._statusResetTimer) {
+                clearTimeout(node._statusResetTimer);
+                node._statusResetTimer = null;
+            }
+            node._statusReporter.cancel();
+            node.status({});
+
+            const finish = (typeof done === 'function') ? done : (typeof removed === 'function' ? removed : () => {});
+
+            const releasePromise = (node.poolRefAcquired && node.workerPoolKey)
+                ? releaseWorkerPool(node.workerPoolKey)
+                : Promise.resolve();
+
+            node.poolRefAcquired = false;
+
+            if (releasePromise && typeof releasePromise.then === 'function') {
+                releasePromise
+                    .then(() => finish())
+                    .catch(() => finish());
+            } else {
+                finish();
+            }
+        });
+    }
+
+    /**
+     * Execute Python code in HOT mode (persistent worker)
+     */
+    function executeHotMode(node, originalMsg, pythonMsg, contextSnapshot, send, done, timing) {
+        const startTime = Date.now();
+        let timedOut = false;
+        let cancelHandle = null;
+
+        // Set timeout
+        const timeoutId = setTimeout(() => {
+            timedOut = true;
+            setHotStatus(node, "red", "ring", "hot: timeout");
+            logHotStats(node, 'Hot execution timed out');
+
+            if (cancelHandle && typeof cancelHandle.cancel === 'function') {
+                cancelHandle.cancel('Python execution timed out');
+            }
+
+            done(new Error(`Python execution timed out after ${node.timeout}ms`));
+        }, node.timeout);
+
+        // Execute on worker pool
+        const executionCallback = (error, payload) => {
+            if (timedOut) {
+                return;
+            }
+
+            clearTimeout(timeoutId);
+
+            const execTime = Date.now() - startTime;
+
+            if (error) {
+                const finishError = () => {
+                    if (error.logs) {
+                        applyPythonLogs(node, error.logs, originalMsg);
+                    }
+                    setHotStatus(node, "red", "ring", `hot: error (${execTime}ms)`);
+                    logHotStats(node, `Hot execution failed after ${execTime}ms`);
+                    const errorMessage = error && (error.message || error.toString());
+                    done(new Error(`${error.type || 'Error'}: ${errorMessage}`));
+                };
+                if (error.contextUpdates) {
+                    afterContextUpdates(node, tryApplyContextUpdates(node, error.contextUpdates, originalMsg), originalMsg, finishError);
+                } else {
+                    finishError();
+                }
+                return;
+            }
+
+            let resultData;
+            let performanceData = null;
+            let contextUpdates = null;
+            let logs = null;
+
+            if (payload && typeof payload === 'object' && Object.prototype.hasOwnProperty.call(payload, 'result')) {
+                resultData = payload.result;
+                performanceData = payload.performance || null;
+                contextUpdates = payload.contextUpdates || null;
+                logs = payload.logs || null;
+            } else {
+                resultData = payload;
+            }
+
+            if (resultData === undefined || resultData === null) {
+                resultData = {};
+            }
+
+            const totalMs = hrtimeDiffToMs(timing && timing.start);
+
+            // Merge result into original message
+            const outputMsg = Object.assign({}, originalMsg, resultData || {});
+
+            const mergedPerformance = Object.assign({}, performanceData || {});
+            mergedPerformance.totalMs = totalMs;
+            applyPerformanceMetrics(node, originalMsg, outputMsg, mergedPerformance);
+
+            const finish = () => {
+                applyPythonLogs(node, logs, originalMsg);
+
+                // Send output
+                send(outputMsg);
+                setHotStatus(node, "green", "dot", `hot: ${execTime}ms`);
+                logHotStats(node, `Hot execution completed in ${execTime}ms`);
+
+                // Clear status after 3 seconds of quiet
+                scheduleStatusReset(node, () => setHotStatus(node, "green", "dot", "hot: ready"));
+
+                done();
+            };
+
+            afterContextUpdates(node, tryApplyContextUpdates(node, contextUpdates, originalMsg), originalMsg, finish);
+        };
+
+        try {
+            cancelHandle = node.workerPool.execute(pythonMsg, node.func, executionCallback, {
+                nodeId: node.workerPoolKey,
+                codeId: node._codeId,
+                ctx: contextSnapshot
+            });
+        } catch (dispatchError) {
+            clearTimeout(timeoutId);
+            const errObj = dispatchError instanceof Error ? dispatchError : new Error(String(dispatchError));
+            setHotStatus(node, "red", "ring", "hot: dispatch failed");
+            done(errObj);
+            return;
+        }
+
+        setHotStatus(node, "blue", "dot", "hot: running");
+        logHotStats(node, 'Dispatching message to hot worker');
+
+        if (!cancelHandle || typeof cancelHandle.cancel !== 'function') {
+            cancelHandle = null;
+        }
+    }
+
+    /**
+     * Execute Python code in COLD mode (spawn new process)
+     */
+    function executeColdMode(node, msg, pythonMsg, contextSnapshot, send, done, timing) {
+        // Show running status
+        reportStatus(node, "blue", "dot", "cold: running");
+
+        const startTime = Date.now();
+
+        if (node._coldScript === null) {
+            node._coldScript = buildColdScript(node.func);
+        }
+
+        // Spawn Python process
+        const pythonProcess = spawn(node.pythonPath, ['-c', node._coldScript]);
+
+        const stdoutChunks = [];
+        const stderrChunks = [];
+        let timedOut = false;
+
+        // Set timeout
+        const timeoutId = setTimeout(() => {
+            timedOut = true;
+            pythonProcess.kill();
+            reportStatus(node, "red", "ring", "timeout");
+            done(new Error(`Python execution timed out after ${node.timeout}ms`));
+        }, node.timeout);
+
+        // Collect stdout
+        pythonProcess.stdout.on('data', (data) => {
+            stdoutChunks.push(data);
+        });
+
+        // Collect stderr
+        pythonProcess.stderr.on('data', (data) => {
+            stderrChunks.push(data);
+        });
+
+        // Handle process completion
+        pythonProcess.on('close', (code) => {
+            clearTimeout(timeoutId);
+
+            if (timedOut) {
+                return; // Already handled by timeout
+            }
+
+            if (code !== 0) {
+                // Python script failed
+                const stderrData = Buffer.concat(stderrChunks).toString('utf8');
+                let errorMessage = 'Python execution failed';
+                let errorObj = null;
+
                 try {
-                    const rawOutput = JSON.parse(stdoutData.trim());
-                    const execTime = Date.now() - startTime;
-                    const totalMs = hrtimeDiffToMs(timing && timing.start);
-
-                    let resultPayload;
-                    let performanceData = null;
-                    let contextUpdates = null;
-                    let logs = null;
-
-                    if (rawOutput && typeof rawOutput === 'object' && Object.prototype.hasOwnProperty.call(rawOutput, '__rosepetal_result')) {
-                        resultPayload = rawOutput.__rosepetal_result || {};
-                        performanceData = rawOutput.__rosepetal_performance || null;
-                        contextUpdates = rawOutput.__rosepetal_context_updates || null;
-                        logs = rawOutput.__rosepetal_logs || null;
-                    } else {
-                        resultPayload = rawOutput || {};
+                    errorObj = JSON.parse(stderrData);
+                    if (errorObj && errorObj.type) {
+                        errorMessage = `${errorObj.type}: ${errorObj.error}`;
                     }
+                } catch (e) {
+                    errorMessage = stderrData || errorMessage;
+                }
 
-                    // Merge result into original message
-                    const outputMsg = Object.assign({}, msg, resultPayload || {});
-                    const mergedPerformance = Object.assign({}, performanceData || {});
-                    mergedPerformance.totalMs = totalMs;
-                    applyPerformanceMetrics(node, msg, outputMsg, mergedPerformance);
-                    try {
-                        await applyContextUpdates(node, contextUpdates, msg);
-                    } catch (e) {
-                        node.error(`Failed to apply context updates: ${e.message || e}`, msg);
-                    }
+                const finishError = () => {
+                    reportStatus(node, "red", "ring", "error");
+                    done(new Error(errorMessage));
+                };
+
+                if (errorObj) {
+                    const contextUpdates = errorObj.context_updates || errorObj.__rosepetal_context_updates || null;
+                    const logs = errorObj.logs || errorObj.__rosepetal_logs || null;
+                    afterContextUpdates(node, tryApplyContextUpdates(node, contextUpdates, msg), msg, () => {
+                        applyPythonLogs(node, logs, msg);
+                        finishError();
+                    });
+                    return;
+                }
+
+                finishError();
+                return;
+            }
+
+            // Parse output
+            let rawOutput;
+            try {
+                rawOutput = JSON.parse(Buffer.concat(stdoutChunks).toString('utf8').trim());
+            } catch (e) {
+                reportStatus(node, "red", "ring", "cold: parse error");
+                done(new Error(`Failed to parse Python output: ${e.message}`));
+                return;
+            }
+
+            const execTime = Date.now() - startTime;
+            const totalMs = hrtimeDiffToMs(timing && timing.start);
+
+            let resultPayload;
+            let performanceData = null;
+            let contextUpdates = null;
+            let logs = null;
+
+            if (rawOutput && typeof rawOutput === 'object' && Object.prototype.hasOwnProperty.call(rawOutput, '__rosepetal_result')) {
+                resultPayload = rawOutput.__rosepetal_result || {};
+                performanceData = rawOutput.__rosepetal_performance || null;
+                contextUpdates = rawOutput.__rosepetal_context_updates || null;
+                logs = rawOutput.__rosepetal_logs || null;
+            } else {
+                resultPayload = rawOutput || {};
+            }
+
+            // Bytes returned by Python arrive as shared-memory descriptors:
+            // turn them into Buffers before they reach the flow.
+            const pendingReads = [];
+            const holder = { result: resultPayload };
+            try {
+                hydrateColdResult(holder, pendingReads);
+            } catch (e) {
+                reportStatus(node, "red", "ring", "cold: parse error");
+                done(new Error(`Failed to parse Python output: ${e.message}`));
+                return;
+            }
+
+            const deliver = () => {
+                // Merge result into original message
+                const outputMsg = Object.assign({}, msg, holder.result || {});
+                const mergedPerformance = Object.assign({}, performanceData || {});
+                mergedPerformance.totalMs = totalMs;
+                applyPerformanceMetrics(node, msg, outputMsg, mergedPerformance);
+
+                afterContextUpdates(node, tryApplyContextUpdates(node, contextUpdates, msg), msg, () => {
                     applyPythonLogs(node, logs, msg);
 
                     // Send output
                     send(outputMsg);
-                    node.status({ fill: "green", shape: "dot", text: `cold: ${execTime}ms` });
+                    reportStatus(node, "green", "dot", `cold: ${execTime}ms`);
 
-                    // Clear status after 3 seconds
-                    setTimeout(() => {
-                        node.status({});
-                    }, 3000);
+                    // Clear status after 3 seconds of quiet
+                    scheduleStatusReset(node, () => node._statusReporter.report(() => ({})));
 
                     done();
-                } catch (e) {
-                    node.status({ fill: "red", shape: "ring", text: "cold: parse error" });
-                    done(new Error(`Failed to parse Python output: ${e.message}`));
-                }
-            });
+                });
+            };
 
-            // Handle process errors
-            pythonProcess.on('error', (err) => {
-                clearTimeout(timeoutId);
-                node.status({ fill: "red", shape: "ring", text: "spawn error" });
-
-                if (err.code === 'ENOENT') {
-                    done(new Error(`Python interpreter not found: ${node.pythonPath}`));
-                } else {
-                    done(new Error(`Failed to spawn Python process: ${err.message}`));
-                }
-            });
-
-            // Send input message to Python stdin
-            try {
-                const inputJson = JSON.stringify(pythonPayload);
-                pythonProcess.stdin.write(inputJson);
-                pythonProcess.stdin.end();
-            } catch (e) {
-                clearTimeout(timeoutId);
-                pythonProcess.kill();
-                node.status({ fill: "red", shape: "ring", text: "input error" });
-                done(new Error(`Failed to send input to Python: ${e.message}`));
+            if (pendingReads.length === 0) {
+                deliver();
+            } else {
+                Promise.all(pendingReads).then(deliver, deliver);
             }
+        });
+
+        // Handle process errors
+        pythonProcess.on('error', (err) => {
+            clearTimeout(timeoutId);
+            reportStatus(node, "red", "ring", "spawn error");
+
+            if (err.code === 'ENOENT') {
+                done(new Error(`Python interpreter not found: ${node.pythonPath}`));
+            } else {
+                done(new Error(`Failed to spawn Python process: ${err.message}`));
+            }
+        });
+
+        // Send input message to Python stdin
+        try {
+            const inputJson = JSON.stringify({
+                [MSG_WRAPPER_KEY]: pythonMsg,
+                [CONTEXT_WRAPPER_KEY]: contextSnapshot || EMPTY_CONTEXT
+            });
+            pythonProcess.stdin.write(inputJson);
+            pythonProcess.stdin.end();
+        } catch (e) {
+            clearTimeout(timeoutId);
+            pythonProcess.kill();
+            reportStatus(node, "red", "ring", "input error");
+            done(new Error(`Failed to send input to Python: ${e.message}`));
+        }
+    }
+
+    /**
+     * Cold results only carry shared-memory / base64 descriptors for bytes;
+     * plain Buffer-JSON objects are left untouched (they are ordinary JSON to
+     * the flow, exactly as before).
+     */
+    function hydrateColdResult(holder, pending) {
+        const walk = (parent, key) => {
+            const value = parent[key];
+            if (value === null || typeof value !== 'object') {
+                return;
+            }
+            if (Array.isArray(value)) {
+                for (let i = 0; i < value.length; i++) {
+                    walk(value, i);
+                }
+                return;
+            }
+            if (Object.prototype.hasOwnProperty.call(value, SHARED_SENTINEL_KEY)) {
+                parent[key] = Buffer.alloc(0);
+                pending.push(readSharedFile(value[SHARED_SENTINEL_KEY]).then((buffer) => {
+                    parent[key] = buffer;
+                }));
+                return;
+            }
+            if (Object.prototype.hasOwnProperty.call(value, SHARED_BASE64_KEY)) {
+                try {
+                    parent[key] = Buffer.from(value[SHARED_BASE64_KEY], 'base64');
+                } catch (err) {
+                    parent[key] = Buffer.alloc(0);
+                }
+                return;
+            }
+            const keys = Object.keys(value);
+            for (let i = 0; i < keys.length; i++) {
+                walk(value, keys[i]);
+            }
+        };
+        walk(holder, 'result');
     }
 
     RED.nodes.registerType("python-executor", PythonExecutorNode);

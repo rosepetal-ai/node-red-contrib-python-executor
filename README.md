@@ -75,10 +75,21 @@ return msg
 - **Binary Friendly:** Hot workers stream large Buffers through shared memory instead of JSON, so images and other blobs stay fast.
 
 ## Handling Large Binary Payloads
-- Hot workers drop large Buffers into `/dev/shm` (or your system temp dir) and hand Python the file handle so bytes never touch JSON.
-- Python can return `bytes`, `bytearray`, or `memoryview`; the worker writes them back to shared memory and Node converts them to Buffers automatically.
-- If the filesystem path is unavailable, the system falls back to base64 as a safety net (slower but still works).
-- Temporary blobs are cleaned up as soon as each request finishes—no manual housekeeping required.
+- Hot workers stream Buffers to Python as raw bytes inside the worker's binary frame protocol, so image data never touches JSON or base64 and never hits the filesystem.
+- Python can return `bytes`, `bytearray`, or `memoryview`; they come back the same way and Node converts them to Buffers automatically. This also applies in cold mode.
 - The optimization is automatic—just enable hot mode when you expect heavy binary traffic.
+- Set `ROSEPETAL_PY_INLINE_MAX_BYTES=<bytes>` in Node-RED's environment to route buffers at or above that size through a `/dev/shm` file instead of the pipe (measured slower on Linux, but available if your platform prefers it).
+
+## Performance Notes (hot mode)
+The hot path is built to stay off Node-RED's event loop and to cost as little as possible per message:
+- One binary frame per direction (`u32 length | JSON header | raw blobs`). Nothing is base64-encoded, no temporary files are written, and the user code is shipped to each worker once and cached by id.
+- The message is walked once, copy-on-write, so a message without Buffers costs zero allocations before `JSON.stringify`.
+- Nothing awaits: for a normal message the whole Node side of a round trip is synchronous work of a few microseconds; there are no promises created per key or per value.
+- Node status updates are coalesced (at most one every 50 ms per node) so the editor websocket and Status nodes are not flooded at high message rates. The texts are unchanged: `hot: running`, `hot: 3ms`, `hot: ready`.
+- Workers start with glibc malloc thresholds pinned (`MALLOC_MMAP_THRESHOLD_`, `MALLOC_TRIM_THRESHOLD_`, `MALLOC_TOP_PAD_`) so multi-megabyte image buffers are reused from the heap instead of being page-faulted in on every message. Set `ROSEPETAL_PY_MALLOC_TUNING=0` to disable, or set the variables yourself to override.
+- `rp_to_cv` / `rp_from_cv` use `cv2.cvtColor` for the RGB↔BGR swap when OpenCV is installed (about 100x faster than the NumPy reversed view on a 720p frame; identical bytes).
+- `print()` inside hot-mode code goes to the worker's stderr (visible in the Node-RED log) and can no longer corrupt the worker protocol.
+
+Typical round trips measured on a laptop (Node-RED → Python → Node-RED, one worker): a small dict in ~0.1 ms, a 200-item JSON payload in ~0.5 ms, a 16 KB buffer in ~0.13 ms, a 1280×720 RGB image through `rp_to_cv`/`rp_from_cv` in ~3 ms. The remaining floor for tiny messages is the two process wake-ups of a pipe round trip; on a machine with the `powersave` CPU governor those wake-ups are noticeably slower than with `performance`.
 
 Enjoy mixing Python logic into your Node-RED projects without extra fuss. When you are ready for more performance, flip on Hot Mode and keep building.
