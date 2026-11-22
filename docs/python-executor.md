@@ -27,7 +27,7 @@ The code runs in a Python process outside Node-RED: a new one for each message (
 | **Name** | empty | Label of the node, and the key of its entry in `msg.performance` |
 | **Environment** | none | A [python-environment](./python-environment.md) configuration node. The code runs with the interpreter of that virtual environment |
 | **Python Path** | `python3` | Interpreter used when no environment is selected: a command looked up in the `PATH` of the Node-RED process, or a full path. The field is hidden while an environment is selected |
-| **Timeout (ms)** | `5000` | Time allowed for one message. The spinner of the field goes from 100 to 60000 in steps of 100; an empty value or `0` means 5000 |
+| **Timeout (ms)** | `5000` | Time allowed for one message. The spinner of the field goes from 100 to 60000 in steps of 100; an empty field means 5000 |
 | **Hot Mode** | off | Keep Python processes alive between messages instead of starting one for each message |
 | **Workers** | `1` | Number of processes of the hot pool, from 1 to 10. Shown in hot mode |
 | **Reload Workers** | | Button, shown in hot mode: restarts the workers and runs the preload imports again without a deploy. It does not act on the workers of an environment: see [Limits](#limits) |
@@ -67,9 +67,10 @@ With empty code the message passes through unchanged.
 
 ### Which properties are sent
 
-When the node starts it scans the text of the code for message properties written literally, as `msg['name']`, `msg["name"]` or `msg.get('name', ...)`. Only those properties are sent to Python, together with `_msgid`. If the code names no property in that way, the whole message is sent.
+When the node starts it scans the text of the code for message properties written literally, as `msg['name']`, `msg["name"]`, `msg.get('name', ...)` or `msg.name`. Only those properties are sent to Python, together with `_msgid`. If the code names no property in that way, the whole message is sent.
 
 - The scan reads text: a property named in a comment or inside a string counts.
+- Between brackets, only names made of letters, digits and `_ . $ : -` are recognized: `msg['my key']` is not.
 - `msg[key]` with a variable, `'name' in msg`, `msg.keys()` and a loop over `msg` see only the properties that were sent.
 - The properties that are not sent are not lost: they are in the message that leaves the node. See [Output message](#output-message).
 - This lets the node work after an **http in** node: `msg.req` and `msg.res` cannot be converted, and they are not sent unless the code names them.
@@ -168,9 +169,9 @@ return msg
 | Helper | Result |
 |--------|--------|
 | `rp_to_cv(image)` | A NumPy array of the `dtype` of the image (`uint8` if it has none), with shape `(height, width)` for one channel and `(height, width, channels)` otherwise. When `colorSpace` is `RGB` or `RGBA`, or the image has none, the channels are reordered to BGR or BGRA; an image in another color space is left as it is. `data` can be `bytes`, the `dict` a `Buffer` becomes in cold mode, a list of integers or a base64 string. Raises `ValueError` when `data` does not hold width × height × channels values |
-| `rp_from_cv(array, like=None)` | An image object with `data` as `bytes` (a `Buffer` once it leaves the node) and `width`, `height`, `channels` and `dtype` taken from the array. The array is taken as BGR and reordered to RGB, unless `like` has a `colorSpace` that is not `RGB` or `RGBA`. The `colorSpace` of the result is the one of `like` (`RGB` without `like`), or `GRAY` for an array without a channel axis |
+| `rp_from_cv(array, like=None)` | An image object with `data` as `bytes` (a `Buffer` once it leaves the node) and `width`, `height`, `channels` and `dtype` taken from the array. The array is taken as BGR and reordered to RGB, unless `like` has a `colorSpace` that is not `RGB` or `RGBA`. The `colorSpace` of the result is the one of `like` (`RGB` without `like`), or `GRAY` for an array with fewer than 3 channels |
 
-In cold mode every message imports NumPy and OpenCV again and the pixels travel as a JSON list of numbers. Use hot mode for images.
+In cold mode every message imports NumPy and OpenCV again, and the pixels of an incoming image travel as a JSON list of numbers. Use hot mode for images.
 
 ## Execution modes
 
@@ -199,8 +200,8 @@ The node keeps a pool of Python processes, the **Workers**, that stay alive. Eac
   import numpy as np
   ```
 
-- **Shared pools.** Nodes with the same environment, the same number of workers and the same preload imports share one pool, and its global names with it: a `global` variable set by one node is visible to the others. Each node keeps its own code. The pool stops when the last node that uses it is closed.
-- **Binary data.** A `Buffer` travels as raw bytes next to the JSON, in both directions, without base64 and without temporary files.
+- **Shared pools.** Nodes with the same environment (or all without one), the same number of workers and the same preload imports share one pool, and its global names with it: a `global` variable set by one node is visible to the others. Each node keeps its own code. The pool stops when the last node that uses it is closed.
+- **Binary data.** A `Buffer` travels as raw bytes next to the JSON, in both directions, without base64 and without temporary files, unless `ROSEPETAL_PY_INLINE_MAX_BYTES` is set: see [Environment variables](#environment-variables).
 - **`print()`** goes to the standard error of the worker. It is written to the console of the Node-RED process as `Worker 0 error: Error: Worker stderr: ...` followed by a stack trace; it does not reach the debug sidebar.
 - **Recovery.** A worker that ends (the code calls `os._exit`, the process crashes, a message times out) is started again and runs the preload imports again. The message it was running fails.
 - **Installed packages.** A running worker can import a package installed after it started, and keeps the modules it has already imported: after upgrading a package, the workers have to be restarted to load the new version.
@@ -218,7 +219,8 @@ The node updates its status at most once every 50 ms; when several changes fall 
 | `spawn error` (red) | Cold mode: the interpreter could not be started |
 | `cold: parse error` (red) | Cold mode: the output of the process was not the expected JSON |
 | `input error` (red) | Cold mode: the message could not be written to the process |
-| `hot: starting` (gray) | The pool is starting, or starting again after **Reload Workers** |
+| `hot: starting` (gray) | The pool is not ready: it is starting after a deploy, or restarting after **Reload Workers**. Messages run in cold mode meanwhile |
+| `hot: reloading` (gray) | **Reload Workers** has started to restart the pool |
 | `hot: ready (workers 2, busy 0, queue 0)` (green) | The pool is ready. The numbers are the workers of the pool, those running a message and the messages waiting |
 | `hot: running (...)` (blue) | A message has been given to the pool |
 | `hot: 3ms (...)` (green) | The message finished in that time. Returns to `hot: ready` after 3 seconds without messages |
@@ -237,7 +239,7 @@ The node reports an error with the message attached, so it appears in the debug 
 | Syntax or indentation error in the code | Reported for every message. Hot mode: `SyntaxError: ... (<string>, line 3)`, where the line is one more than the line in the editor. Cold mode: the text Python prints, where the line number also counts the more than 200 lines the node puts before the code |
 | A message exceeds the timeout | `Python execution timed out after 5000ms`. Cold mode: the process is killed. Hot mode: a message that was waiting leaves the queue; for one that was running, the worker is killed and started again |
 | The interpreter does not exist, cold mode | `Python interpreter not found: <path>` |
-| The hot pool cannot start: the interpreter does not exist, a worker does not answer within 5 seconds, or a preload import fails | `Hot worker pool failed to start: <reason>` when the node is deployed. Every message then fails with the reason; the node does not fall back to cold mode. Correct the cause and deploy again |
+| The hot pool cannot start: the interpreter does not exist, a worker does not answer within 5 seconds, or a preload import fails | `Hot worker pool failed to start: <reason>` when the node is deployed, and from the node that started the pool also `Failed to initialize worker pool: <reason>`. Every message then fails with the reason; the node does not fall back to cold mode. Correct the cause and deploy again |
 | The result has a type that JSON does not have | `TypeError: Object of type set is not JSON serializable` |
 | The result has `NaN` or an infinity | Cold mode: `Failed to parse Python output: ...`. Hot mode: `Error: Worker exited unexpectedly`, and the worker is started again |
 | `print()` in cold mode | `Failed to parse Python output: ...` |
@@ -254,7 +256,24 @@ The node reports an error with the message attached, so it appears in the debug 
 - Context is read when the message arrives and written when the code ends: it is not a lock, and overlapping messages overwrite each other's values.
 - Of the Node-RED API, the code has `node.warn` and the flow and global context. There is no node context, and no access to other context stores than the default one.
 - In hot mode, without an environment, the **Python Path** is not part of what identifies a pool: two nodes with different paths, the same number of workers and the same preload imports share the pool of the one that started first, and both run on its interpreter. To separate them, make the number of workers or the text of the preload imports differ (a comment is enough), or use an [environment](./python-environment.md).
-- **Reload Workers** identifies the pool by the number of workers and the preload imports saved in the node, as for a node without environment. For a node that uses an environment it starts or restarts a separate set of workers on the **Python Path** interpreter and leaves the workers of the environment running. To restart those, restart the flows (**Restart Flows** in the deploy menu, or a full deploy).
+- **Reload Workers** finds the pool from the **Workers** value shown in the dialog and the **Preload Imports** saved in the node (an edit of the preload code counts once the dialog has been closed with **Done**), as for a node without environment. When no pool matches, it starts a new one on the **Python Path** interpreter, which a node uses only once a deploy gives it the same settings. For a node that uses an environment it therefore starts or restarts a separate set of workers and leaves the workers of the environment running. To restart those, restart the flows (**Restart Flows** in the deploy menu, or a full deploy).
+
+## Reload endpoint
+
+**Reload Workers** calls an endpoint of the Node-RED admin API, which a script can also call:
+
+```
+POST /python-executor/<id>/reload
+Content-Type: application/json
+
+{"hotMode": true, "workerPoolSize": 2, "preloadImports": "import cv2", "pythonPath": "python3"}
+```
+
+- The path is relative to the address of the editor (`httpAdminRoot`). When `adminAuth` is enabled, send the access token of a user who can deploy, as for the Node-RED Admin API: `Authorization: Bearer <token>`.
+- The pool is chosen from the body, not from `<id>`: the pool of the nodes without environment that have `workerPoolSize` workers (1 to 10) and the preload imports `preloadImports`, as described in [Limits](#limits).
+- An existing pool is stopped and started again with `preloadImports`, and the answer `{"status": "ok", "reloaded": true}` comes once its workers are ready.
+- Otherwise a new pool is started with the interpreter `pythonPath` (`python3` by default): `{"status": "ok", "created": true}`.
+- `hotMode` other than `true` gives the status 400 and `{"error": "Hot mode must be enabled to reload workers"}`. Workers that cannot start give the status 500 and the reason in `error`.
 
 ## Environment variables
 
@@ -262,5 +281,5 @@ The node reads these variables from the environment of the Node-RED process. The
 
 | Variable | Effect |
 |----------|--------|
-| `ROSEPETAL_PY_INLINE_MAX_BYTES` | Hot mode. A `Buffer` of this size in bytes or larger travels through a file in `/dev/shm` instead of next to the JSON. Not set: every buffer travels next to the JSON |
+| `ROSEPETAL_PY_INLINE_MAX_BYTES` | Hot mode. A `Buffer` of this size in bytes or larger travels through a file in `/dev/shm` (in the temporary directory where `/dev/shm` does not exist) instead of next to the JSON. Not set: every buffer travels next to the JSON |
 | `ROSEPETAL_PY_MALLOC_TUNING` | Hot mode, Linux. The node starts the workers with `MALLOC_MMAP_THRESHOLD_` (32 MiB), `MALLOC_TRIM_THRESHOLD_` (128 MiB) and `MALLOC_TOP_PAD_` (16 MiB), so that the memory of large buffers is reused between messages. Each one is set only if the environment does not define it already. `0` disables the three |

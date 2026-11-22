@@ -1,6 +1,6 @@
 ---
 title: "Python Environment Node - Managed Virtual Environments"
-description: "Reference of the python-environment configuration node for Node-RED: create a Python virtual environment from the editor, install and uninstall its packages with pip, and run python-executor nodes in it. Part of @rosepetal/node-red-contrib-python-executor."
+description: "Reference of the python-environment configuration node for Node-RED: creating a Python virtual environment from the editor, installing and uninstalling its packages with pip, running python-executor nodes in it, and the HTTP endpoints behind the dialog. Part of @rosepetal/node-red-contrib-python-executor."
 sidebar_position: 2
 head:
   - - meta
@@ -51,7 +51,7 @@ The dialog of an existing environment lists its packages with their versions, as
 - **Install**: write what you would pass to `pip install` and press **Install** or Enter. Several requirements are separated by spaces: `numpy opencv-python-headless`. A version goes without spaces inside the requirement: `pandas>=1.0`. Options of pip are accepted: `--upgrade numpy`. The output of pip appears in the dialog as it is produced, followed by `Installation complete` or `Installation failed` with the exit code.
 - Commas do not separate requirements. The placeholder of the field shows a list with commas, but `numpy, pandas` fails: pip receives `numpy,` and rejects it as an invalid requirement.
 - **Uninstall**: the trash button of a package runs `pip uninstall` for it, after a confirmation. `pip`, `setuptools` and `wheel` have no button.
-- The button next to **Installed Packages** reads the list again.
+- The button next to **Installed Packages** reads the list again. Right after **Create Environment** in a new configuration node the list stays empty until this button is pressed or a package is installed.
 
 Packages are installed and removed at once, without a deploy. In cold mode the next message sees the change. In hot mode a worker that is running can import a newly installed package, and keeps the modules it has already imported: see [Hot mode](./python-executor.md#hot-mode).
 
@@ -82,7 +82,7 @@ The environment is not part of the flow. A flow exported to another machine carr
 | `Python not found. Please install Python 3.6+ and ensure it is in your PATH.` | Dialog | None of the Python commands runs in the `PATH` of the Node-RED process |
 | `Python 3.6+ required. Found version ...` | Dialog | The first Python command that runs is older than 3.6 |
 | `The venv module is not available. ...` | Dialog | Python is installed without `venv` |
-| `Environment not found or invalid` | Dialog | There is no environment with that name yet: press **Create Environment** |
+| `Failed to create virtual environment: ...` | Dialog, after **Create Environment** | `python -m venv` failed; the text of its error follows. The partial directory is removed |
 | `Python environment "<name>" not found or invalid` | Node-RED log, when the flows start | The directory of the environment does not exist or has no interpreter |
 | `Python interpreter not found: <path>` | `python-executor` in cold mode, for every message | Same cause |
 | `Hot worker pool failed to start: spawn <path> ENOENT` | `python-executor` in hot mode, when the flows start; then every message fails | Same cause |
@@ -91,4 +91,24 @@ The environment is not part of the flow. A flow exported to another machine carr
 
 - The environment is always created from the first of `python3` and `python` found in the `PATH`. To use another interpreter, create a virtual environment yourself and write the path of its `python` in the **Python Path** of the `python-executor` node, without selecting an environment.
 - An environment cannot be renamed: the name is fixed once it exists.
-- With `adminAuth` enabled in Node-RED, creating and deleting environments and installing and uninstalling packages need the `python-environment.write` permission.
+
+## HTTP endpoints
+
+The dialog works through these endpoints of the Node-RED admin API. A script can call them too, for example to prepare the environments of a flow on a new machine without opening the editor.
+
+- Paths are relative to the address of the editor (`httpAdminRoot`), and bodies are JSON. `<name>` is the name of the environment, URL-encoded; it gives the directory as described in [Where environments are stored](#where-environments-are-stored).
+- When `adminAuth` is enabled, send the access token of a user who can deploy, as for the Node-RED Admin API: `Authorization: Bearer <token>`.
+- A failure answers with a 4xx or 5xx status and its text in `error`. `validate` answers an environment that does not exist with `valid` set to `false`.
+
+| Method and path | Body | Result |
+|-----------------|------|--------|
+| `POST /python-environment/detect-python` | none | The Python that environments are created from, as the dialog shows it: `success` (`true`), `python` (its path), `version` and `command`. Status 400 with an `errorType` such as `not_found`, `version_too_old` or `venv_missing` when no usable Python is found |
+| `POST /python-environment/create-for-name` | `{"name": "vision"}` | Creates the environment as **Create Environment** does and answers `success`, `exists` (`false`), `name`, `sanitizedName`, `envPath`, `pythonPath` and `pythonVersion`. An environment whose interpreter exists is left as it is and answered with `exists` set to `true` |
+| `GET /python-environment/by-name/<name>/validate` | none | `valid` (`true` when the interpreter of the environment exists), `envPath`, `pythonPath`, `pythonVersion` and `createdAt` |
+| `GET /python-environment/by-name/<name>/packages` | none | `packages`: a list of `{"name": ..., "version": ...}`, as `pip list` gives them |
+| `POST /python-environment/by-name/<name>/packages` | `{"package": "numpy opencv-python-headless"}` | Runs `pip install` with the requirements separated by spaces. The answer is a stream of server-sent events: `output` (`text`, and `type` `stdout` or `stderr`) for each piece of output, then `complete` (`code` and `success`). The status is 200 also when pip fails: read `success` |
+| `DELETE /python-environment/by-name/<name>/packages/<package>` | none | Runs `pip uninstall -y` for the package and answers `success` (`true`) |
+| `DELETE /python-environment/by-name/<name>` | none | Removes the directory of the environment and answers `success` (`true`). Status 404 when it does not exist |
+| `GET /python-environment/list` | none | `environments`: every directory under `~/.node-red/python-envs`, with `name`, `sanitizedName`, `envPath`, `pythonPath`, `valid`, `createdAt` and `pythonVersion` |
+
+The same operations exist for a deployed configuration node, with its id in place of `by-name/<name>`: `/python-environment/<id>/validate`, `/python-environment/<id>/packages`, `/python-environment/<id>/packages/<package>` and `/python-environment/<id>`. They answer 404 when no configuration node with that id is deployed. `POST /python-environment/create` takes the same body as `create-for-name`, but answers 400 when the directory of the environment exists already.
