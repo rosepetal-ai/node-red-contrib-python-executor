@@ -1,6 +1,6 @@
 ---
 title: "Python Environment Node - Managed Virtual Environments"
-description: "Reference of the python-environment configuration node for Node-RED: creating a Python virtual environment from the editor, installing and uninstalling its packages with pip, running python-executor nodes in it, and the HTTP endpoints behind the dialog. Part of @rosepetal/node-red-contrib-python-executor."
+description: "Reference of the python-environment configuration node for Node-RED: creating a Python virtual environment from the editor, installing and uninstalling its packages with pip and running python-executor nodes in it. Part of @rosepetal/node-red-contrib-python-executor."
 sidebar_position: 2
 head:
   - - meta
