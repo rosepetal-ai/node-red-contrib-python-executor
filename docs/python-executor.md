@@ -258,23 +258,6 @@ The node reports an error with the message attached, so it appears in the debug 
 - In hot mode, without an environment, the **Python Path** is not part of what identifies a pool: two nodes with different paths, the same number of workers and the same preload imports share the pool of the one that started first, and both run on its interpreter. To separate them, make the number of workers or the text of the preload imports differ (a comment is enough), or use an [environment](./python-environment.md).
 - **Reload Workers** finds the pool from the **Workers** value shown in the dialog and the **Preload Imports** saved in the node (an edit of the preload code counts once the dialog has been closed with **Done**), as for a node without environment. When no pool matches, it starts a new one on the **Python Path** interpreter, which a node uses only once a deploy gives it the same settings. For a node that uses an environment it therefore starts or restarts a separate set of workers and leaves the workers of the environment running. To restart those, restart the flows (**Restart Flows** in the deploy menu, or a full deploy).
 
-## Reload endpoint
-
-**Reload Workers** calls an endpoint of the Node-RED admin API, which a script can also call:
-
-```
-POST /python-executor/<id>/reload
-Content-Type: application/json
-
-{"hotMode": true, "workerPoolSize": 2, "preloadImports": "import cv2", "pythonPath": "python3"}
-```
-
-- The path is relative to the address of the editor (`httpAdminRoot`). When `adminAuth` is enabled, send the access token of a user who can deploy, as for the Node-RED Admin API: `Authorization: Bearer <token>`.
-- The pool is chosen from the body, not from `<id>`: the pool of the nodes without environment that have `workerPoolSize` workers (1 to 10) and the preload imports `preloadImports`, as described in [Limits](#limits).
-- An existing pool is stopped and started again with `preloadImports`, and the answer `{"status": "ok", "reloaded": true}` comes once its workers are ready.
-- Otherwise a new pool is started with the interpreter `pythonPath` (`python3` by default): `{"status": "ok", "created": true}`.
-- `hotMode` other than `true` gives the status 400 and `{"error": "Hot mode must be enabled to reload workers"}`. Workers that cannot start give the status 500 and the reason in `error`.
-
 ## Environment variables
 
 The node reads these variables from the environment of the Node-RED process. The Python processes inherit that environment.
