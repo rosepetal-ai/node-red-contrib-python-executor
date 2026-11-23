@@ -4,6 +4,16 @@ Python into your Node-RED flows with a node that feels familiar, stays friendly,
 
 ![Example](assets/example.png)
 
+## Documentation
+
+| Page | Contents |
+|------|----------|
+| [Overview](docs/index.md) | Installation, requirements, the two nodes, a quick start and the execution modes |
+| [python-executor](docs/python-executor.md) | Reference of the node: properties, input and output messages, context, image helpers, cold and hot mode, status, errors and limits |
+| [python-environment](docs/python-environment.md) | Reference of the configuration node that creates Python virtual environments and manages their packages |
+
+The same pages are published at <https://docs.rosepetal.ai/flows/node-red-contrib-python-executor>.
+
 ## What You Get
 - Run small Python snippets whenever a message arrives.
 - Reuse your favorite Python tools without leaving Node-RED.
@@ -11,12 +21,22 @@ Python into your Node-RED flows with a node that feels familiar, stays friendly,
 - See clear status updates so you always know what is happening.
 
 ## Before You Start
-- Install Python 3 on the machine running Node-RED.
+- Install Python 3 (3.6 or later) on the machine running Node-RED.
 - Know where your Python interpreter lives (for most systems it is `python3`).
+
+## Installation
+
+```bash
+cd ~/.node-red
+npm install @rosepetal/node-red-contrib-python-executor
+```
+
+Mind the `@rosepetal/` scope: `node-red-contrib-python-executor` without it is a different package on npm.
 
 ## Node Options
 - **Name** – Optional label that appears on the canvas.
-- **Python Path** – The command Node-RED should run (for example `python3` or a full path if you use a virtual environment).
+- **Environment** – Optional Python virtual environment, created from the editor with its own packages (see [python-environment](docs/python-environment.md)). When one is selected, the node runs its interpreter.
+- **Python Path** – The command Node-RED should run when no Environment is selected (for example `python3` or a full path if you use a virtual environment).
 - **Timeout** – How long to wait for Python to finish before giving up. Useful to stop code that gets stuck.
 - **Python Code** – Your script. It always receives a message named `msg`, and whatever you return is passed along.
 - **Hot Mode** – Keeps Python processes running between messages for faster responses.
@@ -62,7 +82,7 @@ return msg
 
 - `rp_to_cv(obj)` returns a NumPy array. RGB/RGBA inputs are reordered to **BGR/BGRA** (OpenCV's convention); grayscale stays 2-D. It honors `colorSpace` and `dtype`, and accepts `data` as raw bytes, a Node Buffer, a list, or base64.
 - `rp_from_cv(arr, like=obj)` returns a Rosepetal image dict. The array is assumed BGR and reordered back to RGB. Pass the source dict as `like=` to preserve its `colorSpace` label.
-- `data` comes back as raw bytes, so it rides the shared-memory fast path in hot mode (no base64 bloat).
+- `data` comes back as raw bytes, so in hot mode it rides the worker's binary frames (no base64 bloat).
 - Both helpers work in hot **and** cold mode. Library imports do not: cold mode starts a fresh interpreter per
   message, so `import cv2` belongs at the top of your code and **Preload Imports** applies to hot mode only.
   Re-importing numpy + OpenCV costs roughly 100 ms per message, so use hot mode for image work.
@@ -72,7 +92,7 @@ return msg
 - **Flexible:** Supports both simple scripts and larger libraries.
 - **Fast:** Hot mode cuts response time dramatically for repeat work.
 - **Clear:** Status messages and notifications help you see what is working and what needs attention.
-- **Binary Friendly:** Hot workers stream large Buffers through shared memory instead of JSON, so images and other blobs stay fast.
+- **Binary Friendly:** Hot workers stream Buffers as raw bytes next to the JSON instead of inside it, so images and other blobs stay fast.
 
 ## Handling Large Binary Payloads
 - Hot workers stream Buffers to Python as raw bytes inside the worker's binary frame protocol, so image data never touches JSON or base64 and never hits the filesystem.
